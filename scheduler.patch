@@ -1,0 +1,947 @@
+diff --git a/Makefile b/Makefile
+index e92e509..9111ce3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -32,9 +32,9 @@ $(NODE):
+ 	curl -L https://nodejs.org/dist/v$(NODE_VERSION)/node-v$(NODE_VERSION)-linux-x64.tar.xz | tar --extract --xz --directory ./bins
+ 	mv -f ./bins/node-v$(NODE_VERSION)-linux-x64 "$(NODE_DIR)"
+
+-node_modules: 
++node_modules:
+ 	@echo "Installing dependencies"
+-	@CFLAGS="-I$(NODE_DIR)/include" PATH=$(PATH) npm $$(test -e ./package-lock.json && echo 'clean-install' || echo "install")
++	@CFLAGS="-I$(NODE_DIR)/include -Wno-error=incompatible-pointer-types" PATH=$(PATH) npm $$(test -e ./package-lock.json && echo 'clean-install' || echo "install")
+
+ FIAT_DATA_DIR=src/bridge/fiat-bridge/data
+ FIAT_CHECKSUMS=$(FIAT_DATA_DIR)/sha256sums
+diff --git a/rollup.config.js b/rollup.config.js
+index 2fe3fbf..c3baf93 100644
+--- a/rollup.config.js
++++ b/rollup.config.js
+@@ -21,7 +21,7 @@ const external = [
+
+ export default [
+   {
+-    input: ["src/CryptOpt.ts", "src/CountCycle.ts"],
++    input: ["src/CryptOpt.ts", "src/CountCycle.ts", "src/GenerateStartState.ts", "src/Assemble.ts"],
+     output: {
+       dir: "dist",
+       format: "es",
+diff --git a/src/Assemble.ts b/src/Assemble.ts
+new file mode 100644
+index 0000000..ed6ce02
+--- /dev/null
++++ b/src/Assemble.ts
+@@ -0,0 +1,52 @@
++/**
++ * Copyright 2023 University of Adelaide
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import { parsedArgs } from "@/helper";
++import { resolve } from "path";
++import { Model } from "@/model";
++import { assemble } from "./assembler";
++import type { asm, CryptOpt } from "@/types";
++import { readFileSync } from "fs";
++import { tmpdir } from "os";
++import { FiatBridge } from "./bridge/fiat-bridge";
++
++let args = parsedArgs;
++if (!args.readState) {
++  console.error(`Must pass state file to assemble with --readState`);
++  process.exit(1);
++}
++
++const stateFile: CryptOpt.StateFile = JSON.parse(readFileSync(args.readState).toString());
++args = stateFile.parsedArgs;
++
++if (!parsedArgs.readState) throw new Error("Assemble.ts: must pass --readState!");
++
++const tmpDir = tmpdir();
++const sharedObjectFilename = resolve(
++  tmpDir,
++  `libcheckfunctions-s${args.seed}-b${args.bridge}-p${process.pid}.so`,
++);
++
++const bridge = new FiatBridge();
++const symbolname = bridge.machinecode(sharedObjectFilename, args.method, args.curve);
++const json = bridge.getCryptOptFunction(args.method, args.curve);
++Model.import(parsedArgs.readState, json);
++
++const strip = (code: asm[]) => code.filter((line) => line && !line.startsWith(";") && line !== "\n");
++const { code } = assemble(parsedArgs.resultDir);
++process.stdout.write(
++  strip(["SECTION .text", `\tGLOBAL ${symbolname}`, `${symbolname}:`].concat(code)).join("\n"),
++);
+diff --git a/src/CountCycle.ts b/src/CountCycle.ts
+index df0b9d7..bc76cde 100644
+--- a/src/CountCycle.ts
++++ b/src/CountCycle.ts
+@@ -164,6 +164,9 @@ function createMS(
+       ...KNOWN_SYMBOLS[symbol],
+       seed,
+       memoryConstraints: "none",
++      // Has no effect here, as we just read asm file directly; just added to satisfy type checker.
++      schedulingAlgorithm: "default",
++      pmLookahead: 1,
+     }).measuresuite;
+   }
+
+@@ -181,6 +184,9 @@ function createMS(
+     cFile: cFilename,
+     seed,
+     memoryConstraints: "none",
++    // See comment above.
++    schedulingAlgorithm: "default",
++    pmLookahead: 1,
+   }).measuresuite;
+ }
+
+diff --git a/src/GenerateStartState.ts b/src/GenerateStartState.ts
+new file mode 100644
+index 0000000..0716e8c
+--- /dev/null
++++ b/src/GenerateStartState.ts
+@@ -0,0 +1,35 @@
++/**
++ * Copyright 2023 University of Adelaide
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import { parsedArgs } from "@/helper";
++
++import { Model } from "@/model";
++import { init } from "@/optimizer";
++import { join } from "path";
++import { sha1Hash } from "./paul";
++import { tmpdir } from "os";
++
++const randomString = sha1Hash(Math.ceil(Date.now() * Math.random())).toString(36);
++const cacheDir = tmpdir();
++const libcheckfunctionDirectory = join(cacheDir, "CryptOpt.cache", randomString);
++init(libcheckfunctionDirectory, parsedArgs);
++
++const state = {
++  ...Model.getState(),
++  parsedArgs,
++};
++process.stdout.write(JSON.stringify(state, null, 2));
++process.stdout.write("\n");
+diff --git a/src/helper/argParse.ts b/src/helper/argParse.ts
+index 0c455bc..8dc1e03 100644
+--- a/src/helper/argParse.ts
++++ b/src/helper/argParse.ts
+@@ -30,7 +30,12 @@ import {
+ } from "@/bridge/fiat-bridge/constants";
+ import { errorOut, ERRORS } from "@/errors";
+
+-import { FRAME_POINTER_OPTIONS, MEMORY_CONSTRAINTS_OPTIONS, ParsedArgsT } from "../types";
++import {
++  FRAME_POINTER_OPTIONS,
++  MEMORY_CONSTRAINTS_OPTIONS,
++  ParsedArgsT,
++  SCHEDULING_ALGORITHM_OPTIONS,
++} from "../types";
+
+ const y = await yargs(process.argv.slice(2));
+
+@@ -137,6 +142,18 @@ export const parsedArgs = y
+       "If this is set, CryptOpt will prefer spilling into vector registers as long as they are available, then start spilling into memory. Must specify --xmm switch, too. It will not try to optimize on it. (i.e. The first 16 values to be spilled will be spilled into XMMs, the rest into memory.)",
+     boolean: true,
+   })
++  .option("schedulingAlgorithm", {
++    string: true,
++    default: "default",
++    describe: "Instruction scheduling algorithm to use when constructing initial model node order.",
++    choices: SCHEDULING_ALGORITHM_OPTIONS,
++  })
++  .option("pmLookahead", {
++    number: true,
++    default: 1,
++    min: 1,
++    describe: "How many scheduling steps to look ahead, when performing pressure-minimizing scheduling.",
++  })
+   .option("readState", {
+     string: true,
+     describe: "this must be a filename to a JSON, which has a state (to, body).",
+diff --git a/src/helper/toposort.ts b/src/helper/toposort.ts
+index df5fcdc..271b5ca 100644
+--- a/src/helper/toposort.ts
++++ b/src/helper/toposort.ts
+@@ -70,8 +70,8 @@ export function toposort(
+ export function isADependentOnB(
+   a: number,
+   b: number,
+-  nodes: Nodes,
+-  neededBy: Map<string, Set<string>>,
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  neededBy: ReadonlyMap<string, ReadonlySet<string>>,
+ ): boolean {
+   if (isNaN(a) || isNaN(b)) {
+     throw new Error("only support number numbers");
+diff --git a/src/model/model.class.ts b/src/model/model.class.ts
+index 0755b10..5fb7589 100644
+--- a/src/model/model.class.ts
++++ b/src/model/model.class.ts
+@@ -37,9 +37,9 @@ import {
+ import globals from "@/helper/globals";
+ import Logger from "@/helper/Logger.class";
+ import { BIAS, Paul } from "@/paul";
+-import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T } from "@/types";
++import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T, SCHEDULING_ALGORITHM_OPTIONS_T } from "@/types";
+
+-import { createDependencyRelation, nodeLookupMap } from "./model.helper";
++import { createDependencyRelation, nodeLookupMap, reorderPressureMinimizing } from "./model.helper";
+
+ type methodParam = CryptOpt.Function["arguments"][number] | CryptOpt.Function["returns"][number];
+ export class Model {
+@@ -100,12 +100,22 @@ export class Model {
+     process.stdout.write(`\nWrote ${cy}${filename}${re} `);
+   }
+
+-  public static import(filename: fs.PathLike) {
++  public static import(filename: fs.PathLike, json?: CryptOpt.Function) {
+     const parsed = JSON.parse(fs.readFileSync(filename).toString());
+-    const { to, body, seed, convergence } = parsed;
++    const { to, body, seed, convergence, parsedArgs } = parsed;
++    if (json !== undefined) {
++      Model._methodParameters = json.returns;
++      Model._methodParameters = Model._methodParameters.concat(json.arguments);
++    }
+     const m = Model.getInstance();
+     Model._order = to;
+     Model._nodes = body;
++    Model._nodeLookupMap = nodeLookupMap(Model._nodes);
++    Model._neededBy = createDependencyRelation(
++      Model._nodes,
++      Model._nodeLookupMap,
++      parsedArgs?.memoryConstraints,
++    );
+     Paul.seed = seed;
+     globals.convergence = convergence;
+     if ("time" in parsed) {
+@@ -118,9 +128,13 @@ export class Model {
+   public static init({
+     json,
+     memoryConstraints,
++    schedulingAlgorithm,
++    pmLookahead,
+   }: {
+     json: CryptOpt.Function;
+     memoryConstraints: MEMORY_CONSTRAINTS_OPTIONS_T;
++    schedulingAlgorithm: SCHEDULING_ALGORITHM_OPTIONS_T;
++    pmLookahead: number;
+   }): void {
+     Model._methodParameters = json.returns;
+     Model._methodParameters = Model._methodParameters.concat(json.arguments);
+@@ -139,7 +153,18 @@ export class Model {
+     Model._nodes = json.body as CryptOpt.StringOperation[];
+     Model._nodeLookupMap = nodeLookupMap(Model._nodes);
+     Model._neededBy = createDependencyRelation(Model._nodes, Model._nodeLookupMap, memoryConstraints);
+-    Model._order = toposort(Model._nodes, Model._neededBy);
++
++    switch (schedulingAlgorithm) {
++      case "default":
++        Model._order = toposort(Model._nodes, Model._neededBy);
++        break;
++      case "pressure-minimized":
++        Model._order = reorderPressureMinimizing(Model._nodes, Model._nodeLookupMap, Model._neededBy, {
++          lookaheadFactor: pmLookahead,
++        });
++        break;
++    }
++
+     Logger.log(Model._order.join(" @ "));
+     Logger.log(
+       Model.nodesInTopologicalOrder
+diff --git a/src/model/model.helper.ts b/src/model/model.helper.ts
+index 9855964..64d463c 100644
+--- a/src/model/model.helper.ts
++++ b/src/model/model.helper.ts
+@@ -21,7 +21,11 @@ import {
+   limbify,
+   limbifyImm,
+   makeU64NameLimbs,
++  assertStringArguments,
++  assertStringNames,
+   OUT_PREFIX,
++  isXD,
++  isADependentOnB,
+ } from "@/helper";
+ import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T, Nodes } from "@/types";
+
+@@ -299,3 +303,234 @@ function groupDepLimbs(
+     }
+   }
+ }
++
++export function reorderPressureMinimizing(
++  // All parsed nodes in their "canonical" order (never changes).
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  // Map of varname (e.g., "x1") => indice in `nodes` which produces this value.
++  nodeIndexOf: ReadonlyMap<string, number>,
++  // Map of varname (e.g., "x1") => set of direct varnames (as such nodes) which require x1 as part of their computation.
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++  options?: {
++    lookaheadFactor?: number;
++  },
++): number[] {
++  // Sanity checks, copied from original random toposorting algo.
++  nodes.forEach(assertStringNames);
++  nodes.forEach(assertStringArguments);
++  // Partial ordering of node indices. Also used as the "scheduled" stack for lookahead simulation below.
++  const order: number[] = [];
++  const numNodes = nodes.length;
++  const toBeScheduled = new Set(nodes.keys());
++
++  const lookaheadFactor = options?.lookaheadFactor ?? 1;
++  if (lookaheadFactor < 1) throw new Error(`invalid lookahead factor: ${lookaheadFactor}`);
++
++  // Memoize results from bestSchedulableCandidate, using partial schedule + depth as key.
++  const cache = new Map<bigint, { nodeIdx: number; totalCost: number }>();
++
++  // Main scheduling loop.
++  while (order.length < numNodes) {
++    const result = bestSchedulableCandidate(
++      toBeScheduled,
++      order,
++      lookaheadFactor,
++      nodes,
++      nodeIndexOf,
++      consumersOf,
++      cache,
++    );
++    if (result === undefined) {
++      throw new Error(`Expected at least one schedulable operation, got 0. Bad dependency graph?`);
++    }
++    order.push(result.nodeIdx);
++    toBeScheduled.delete(result.nodeIdx);
++  }
++
++  return order;
++}
++
++// Returns the net register-pressure cost (born - freed) of scheduling `node` given the
++// partial schedule `scheduled` so far. Pure with respect to its inputs.
++export function computeSchedulingCost(
++  node: CryptOpt.StringOperation,
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  nodeIndexOf: ReadonlyMap<string, number>,
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++  scheduled: ReadonlyArray<number>,
++): number {
++  const born = bornSet(node, consumersOf).size;
++  const freed = freedSet(node, nodes, nodeIndexOf, consumersOf, scheduled).size;
++  return born - freed;
++}
++
++// Recursively determines which currently schedulable candidate minimizes the total
++// scheduling cost over up to `depth` steps (this candidate's own cost, plus the best
++// achievable cost of the following `depth - 1` steps).
++function bestSchedulableCandidate(
++  toBeScheduled: Set<number>,
++  scheduled: number[],
++  depth: number,
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  nodeIndexOf: ReadonlyMap<string, number>,
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++  cache: Map<bigint, { nodeIdx: number; totalCost: number }>,
++): { nodeIdx: number; totalCost: number } | undefined {
++  if (toBeScheduled.size === 0) return undefined;
++
++  const cacheKey = computeCacheKey(toBeScheduled, depth);
++  const cached = cache.get(cacheKey);
++  if (cached !== undefined) return cached;
++
++  const schedulable = getAllSchedulable(toBeScheduled, nodes, consumersOf).sort((a, b) => a - b);
++  if (schedulable.length === 0) {
++    throw new Error(`Expected at least one schedulable operation, got 0. Bad dependency graph?`);
++  }
++
++  const immediateCosts = new Map(
++    schedulable.map((candidateIdx) => [
++      candidateIdx,
++      computeSchedulingCost(nodes[candidateIdx], nodes, nodeIndexOf, consumersOf, scheduled),
++    ]),
++  );
++
++  let bestNodeIdx = schedulable[0];
++  let bestTotalCost = Infinity;
++
++  for (const candidateIdx of schedulable) {
++    const cost = immediateCosts.get(candidateIdx)!;
++
++    scheduled.push(candidateIdx);
++    toBeScheduled.delete(candidateIdx);
++
++    const restCost =
++      depth > 1
++        ? bestSchedulableCandidate(
++            toBeScheduled,
++            scheduled,
++            depth - 1,
++            nodes,
++            nodeIndexOf,
++            consumersOf,
++            cache,
++          )?.totalCost ?? 0
++        : 0;
++
++    scheduled.pop();
++    toBeScheduled.add(candidateIdx);
++
++    const totalCost = cost + restCost;
++    if (totalCost < bestTotalCost) {
++      bestTotalCost = totalCost;
++      bestNodeIdx = candidateIdx;
++    }
++  }
++
++  const result = { nodeIdx: bestNodeIdx, totalCost: bestTotalCost };
++  cache.set(cacheKey, result);
++  return result;
++}
++
++// Used for keying memoization hashmap in main scheduling loop.
++function computeCacheKey(toBeScheduled: ReadonlySet<number>, depth: number): bigint {
++  let mask = 0n;
++  for (const nodeIdx of toBeScheduled) {
++    mask |= 1n << BigInt(nodeIdx);
++  }
++  return (mask << 32n) | BigInt(depth);
++}
++
++// Returns a list of schedulable operations, based upon all toBeScheduled operations.
++export function getAllSchedulable(
++  toBeScheduled: Set<number>,
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++): number[] {
++  const schedulable = [] as number[];
++  for (const possibleCandidate of toBeScheduled) {
++    let canSchedule = true;
++    for (const unscheduledNodes of toBeScheduled) {
++      if (isADependentOnB(possibleCandidate, unscheduledNodes, nodes, consumersOf)) {
++        canSchedule = false;
++        break;
++      }
++    }
++    if (canSchedule) {
++      schedulable.push(possibleCandidate);
++    }
++  }
++  return schedulable;
++}
++
++// Returns a set of variables which are "born" by an operation (i.e., it's outputs, limbified).
++// Accounts for 128-bit operations requiring two virtual registers.
++export function bornSet(
++  node: CryptOpt.StringOperation,
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++): Set<CryptOpt.Varname> {
++  const limbs = makeU64NameLimbs(node);
++  const born = new Set<CryptOpt.Varname>();
++  // Filter out non-intermediates (e.g., out[1]) and variables which have no consumers
++  // (probably not necessary, given that the only variables of such types are out[n]).
++  limbs.forEach((limb) => {
++    if ((consumersOf.get(limb)?.size ?? 0) > 0 && isXD(limb)) {
++      born.add(limb);
++    }
++  });
++  return born;
++}
++
++export function freedSet(
++  node: CryptOpt.StringOperation,
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  nodeIndexOf: ReadonlyMap<string, number>,
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++  scheduled: ReadonlyArray<number>,
++): Set<string> {
++  // First, get all intermediate arguments for this node.
++  const vars = new Set<string>();
++  const args = node.arguments.filter(isXD);
++  // Next, determine for each of these args whether all other consumers have already been scheduled.
++  args.forEach((arg) => {
++    // consumersOf is keyed by limb (e.g. "x12_0"/"x12_1"), never by a u128's base name (e.g. "x12"),
++    // so a u128 arg must be expanded into its limbs before it can be looked up.
++    const nodeThatProducesThisArg = nodes[nodeIndexOf.get(arg)!];
++    const argLimbs = nodeThatProducesThisArg.datatype === "u128" ? limbify(arg) : [arg];
++    argLimbs
++      .filter((limb) => consumersOf.has(limb))
++      .forEach((limb) => {
++        // If this node is the last consumer, this implies that we free it. So, add it to the vars list.
++        if (isNodeFinalConsumerOf(node, limb, nodeIndexOf, consumersOf, scheduled)) {
++          vars.add(limb);
++        }
++      });
++  });
++
++  return vars;
++}
++
++export function isNodeFinalConsumerOf(
++  node: CryptOpt.StringOperation,
++  arg: string,
++  nodeIndexOf: ReadonlyMap<string, number>,
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++  scheduled: ReadonlyArray<number>,
++) {
++  const consumers = consumersOf.get(arg);
++  if (consumers === undefined) throw new Error(`arg ${arg} has no consumers`);
++
++  // node.name[0] may be "_" (i.e., a discarded output such as an unused carry portion)
++  // This is an invalid name in the node lookup map, so in this case just
++  // fall back to any other name the node produces to find its own index.
++  const ownName = node.name.find((n) => nodeIndexOf.has(n));
++  const nodeIdx = ownName === undefined ? undefined : nodeIndexOf.get(ownName);
++  if (nodeIdx === undefined) throw new Error(`node ${node} has no valid index`);
++
++  for (const con of consumers) {
++    const consumerNodeIndex = nodeIndexOf.get(con)!;
++    if (consumerNodeIndex !== nodeIdx && !scheduled.includes(consumerNodeIndex)) {
++      return false;
++    }
++  }
++  return true;
++}
+diff --git a/src/optimizer/optimizer.helper.class.ts b/src/optimizer/optimizer.helper.class.ts
+index 1843b54..f474a67 100644
+--- a/src/optimizer/optimizer.helper.class.ts
++++ b/src/optimizer/optimizer.helper.class.ts
+@@ -25,7 +25,10 @@ import { ManualBridge } from "@/bridge/manual-bridge";
+ import { Model } from "@/model";
+ import { OptimizerArgs } from "@/types";
+
+-type needComms = Pick<OptimizerArgs, "bridge" | "seed" | "memoryConstraints">;
++type needComms = Pick<
++  OptimizerArgs,
++  "bridge" | "seed" | "memoryConstraints" | "schedulingAlgorithm" | "pmLookahead"
++>;
+ interface needJasmin extends needComms {
+   bridge: "jasmin";
+ }
+@@ -60,6 +63,8 @@ function initFiat(sharedObjectFilename: string, args: needFiat): ret {
+   Model.init({
+     memoryConstraints: args.memoryConstraints,
+     json: bridge.getCryptOptFunction(args.method, args.curve),
++    schedulingAlgorithm: args.schedulingAlgorithm,
++    pmLookahead: args.pmLookahead,
+   });
+
+   const symbolname = bridge.machinecode(sharedObjectFilename, args.method, args.curve);
+@@ -77,6 +82,8 @@ function initBitcoinCore(sharedObjectFilename: string, args: needBitcoinCore): r
+   Model.init({
+     memoryConstraints: args.memoryConstraints,
+     json: bridge.getCryptOptFunction(args.method),
++    schedulingAlgorithm: args.schedulingAlgorithm,
++    pmLookahead: args.pmLookahead,
+   });
+
+   const symbolname = bridge.machinecode(sharedObjectFilename, args.method);
+@@ -95,6 +102,8 @@ function initJasmin(sharedObjectFilename: string, args: needJasmin): ret {
+   Model.init({
+     memoryConstraints: args.memoryConstraints,
+     json: bridge.getCryptOptFunction(),
++    schedulingAlgorithm: args.schedulingAlgorithm,
++    pmLookahead: args.pmLookahead,
+   });
+
+   const symbolname = bridge.machinecode(sharedObjectFilename);
+@@ -118,6 +127,8 @@ function initManual(sharedObjectFilename: string, args: needManual): ret {
+   Model.init({
+     memoryConstraints: args.memoryConstraints,
+     json: bridge.getCryptOptFunction(),
++    schedulingAlgorithm: args.schedulingAlgorithm,
++    pmLookahead: args.pmLookahead,
+   });
+   const symbolname = bridge.machinecode(sharedObjectFilename);
+   const chunksize = 16; // only for reading the chunk breaks atm. see MS code
+diff --git a/src/types/CryptOpt.namespace.ts b/src/types/CryptOpt.namespace.ts
+index aabb8ae..73fbcc6 100644
+--- a/src/types/CryptOpt.namespace.ts
++++ b/src/types/CryptOpt.namespace.ts
+@@ -32,6 +32,9 @@ export type FRAME_POINTER_OPTIONS_T = (typeof FRAME_POINTER_OPTIONS)[number];
+ export const MEMORY_CONSTRAINTS_OPTIONS = ["none", "all", "out1-arg1"] as const;
+ export type MEMORY_CONSTRAINTS_OPTIONS_T = (typeof MEMORY_CONSTRAINTS_OPTIONS)[number];
+
++export const SCHEDULING_ALGORITHM_OPTIONS = ["default", "pressure-minimized"] as const;
++export type SCHEDULING_ALGORITHM_OPTIONS_T = (typeof SCHEDULING_ALGORITHM_OPTIONS)[number];
++
+ // eslint-disable-next-line @typescript-eslint/no-namespace
+ export namespace CryptOpt {
+   export type StateFile = {
+diff --git a/src/types/optimizer.types.ts b/src/types/optimizer.types.ts
+index eebd586..6b5026c 100644
+--- a/src/types/optimizer.types.ts
++++ b/src/types/optimizer.types.ts
+@@ -17,7 +17,11 @@
+ import { BRIDGES_T } from "@/bridge";
+ import { METHOD_T } from "@/bridge/bitcoin-core-bridge";
+ import { CURVE_T } from "@/bridge/fiat-bridge";
+-import { FRAME_POINTER_OPTIONS_T, MEMORY_CONSTRAINTS_OPTIONS_T } from "@/types";
++import {
++  FRAME_POINTER_OPTIONS_T,
++  MEMORY_CONSTRAINTS_OPTIONS_T,
++  SCHEDULING_ALGORITHM_OPTIONS_T,
++} from "@/types";
+
+ export type OptimizerArgs = {
+   evals: number;
+@@ -37,6 +41,8 @@ export type OptimizerArgs = {
+   redzone: boolean;
+   preferXmm?: boolean;
+   framePointer: FRAME_POINTER_OPTIONS_T;
++  schedulingAlgorithm: SCHEDULING_ALGORITHM_OPTIONS_T;
++  pmLookahead: number;
+   memoryConstraints: MEMORY_CONSTRAINTS_OPTIONS_T;
+ };
+ export type ParsedArgsT = OptimizerArgs & {
+diff --git a/test/RegisterAllocator.class.ts b/test/RegisterAllocator.class.ts
+index e720aed..a1c89a0 100644
+--- a/test/RegisterAllocator.class.ts
++++ b/test/RegisterAllocator.class.ts
+@@ -161,7 +161,9 @@ describe("RegisterAllocator:", () => {
+         },
+       ] as CryptOpt.StringOperation[],
+     },
++    schedulingAlgorithm: "default",
+     memoryConstraints: "none",
++    pmLookahead: 1,
+   });
+   const ra = RegisterAllocator.getInstance();
+   expect(ra).toBeTruthy();
+diff --git a/test/model.class.ts b/test/model.class.ts
+index bab2466..adecae0 100644
+--- a/test/model.class.ts
++++ b/test/model.class.ts
+@@ -25,6 +25,8 @@ describe("Model.class", () => {
+   const body = createModelHelpers().nodes;
+   Model.init({
+     memoryConstraints: "none",
++    schedulingAlgorithm: "default",
++    pmLookahead: 1,
+     json: {
+       operation: "mul",
+       arguments: [
+diff --git a/test/model.helper.pressureMinimizing.ts b/test/model.helper.pressureMinimizing.ts
+new file mode 100644
+index 0000000..b857d91
+--- /dev/null
++++ b/test/model.helper.pressureMinimizing.ts
+@@ -0,0 +1,279 @@
++/**
++ * Copyright 2023 University of Adelaide
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import { describe, expect, it } from "vitest";
++
++import {
++  bornSet,
++  freedSet,
++  getAllSchedulable,
++  isNodeFinalConsumerOf,
++  nodeLookupMap,
++  createDependencyRelation,
++  computeSchedulingCost,
++  reorderPressureMinimizing,
++} from "@/model";
++import type { CryptOpt } from "@/types";
++
++function makeExampleDfg(): CryptOpt.StringOperation[] {
++  const n = (name: string[], operation: string, args: string[], datatype: string = "u64") =>
++    ({
++      datatype,
++      operation,
++      name,
++      arguments: args,
++      decisions: {},
++      decisionsHot: [],
++    }) as unknown as CryptOpt.StringOperation;
++  return [
++    n(["x1"], "=", ["arg1[0]"]),
++    n(["x2"], "=", ["arg1[1]"]),
++    n(["x3"], "*", ["x1", "x2"], "u128"),
++    n(["x5"], "+", ["x3_0", "x3_1"]),
++    n(["x6"], "+", ["x5", "x5"]),
++    n(["x30"], "+", ["arg1[1]", "x6"]),
++    n(["out1[1]"], "=", ["x1"]),
++    n(["out1[0]"], "=", ["x2"]),
++  ];
++}
++
++describe("computeBornCount / computeFreedCount", () => {
++  const nodes = makeExampleDfg();
++  const map = nodeLookupMap(nodes);
++  const consumersOf = createDependencyRelation(nodes, map);
++  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
++  const scheduled = new Array<number>();
++  describe("with nothing scheduled yet", () => {
++    it.each([
++      ["x1", 1, 0],
++      ["x2", 1, 0],
++      ["x3", 2, 0],
++      ["x5", 1, 2],
++      ["x6", 1, 1],
++      ["x30", 0, 1],
++      ["out1[1]", 0, 0],
++      ["out1[0]", 0, 0],
++    ] as const)("%s: born=%i, freed=%i", (name, expectedBorn, expectedFreed) => {
++      const idx = indexOf(name);
++      expect(bornSet(nodes[idx], consumersOf).size).toBe(expectedBorn);
++      expect(freedSet(nodes[idx], nodes, map, consumersOf, scheduled).size).toBe(expectedFreed);
++    });
++  });
++});
++
++describe("isNodeFinalConsumerOf", () => {
++  const nodes = makeExampleDfg();
++  const nodeIndexOf = nodeLookupMap(nodes);
++  const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
++
++  it("returns false when another (unscheduled) consumer of the arg is still pending", () => {
++    // x1 is consumed by x3 (both limbs) and by out1[1]; with nothing scheduled yet,
++    // out1[1] is still pending, so x3 is not (yet) the final consumer of x1.
++    const x3 = nodes[indexOf("x3")];
++    expect(isNodeFinalConsumerOf(x3, "x1", nodeIndexOf, consumersOf, [])).toBe(false);
++  });
++
++  it("returns true once every other consumer of the arg has been scheduled", () => {
++    // Once out1[1] (the only other consumer of x1) has been scheduled, x3 becomes
++    // the final consumer of x1.
++    const x3 = nodes[indexOf("x3")];
++    const out1_1Idx = indexOf("out1[1]");
++    expect(isNodeFinalConsumerOf(x3, "x1", nodeIndexOf, consumersOf, [out1_1Idx])).toBe(true);
++  });
++
++  it("returns true when the node is the sole consumer of the arg", () => {
++    // x5 is the only consumer of x3_0, so it's trivially the final consumer, regardless
++    // of what's been scheduled.
++    const x5 = nodes[indexOf("x5")];
++    expect(isNodeFinalConsumerOf(x5, "x3_0", nodeIndexOf, consumersOf, [])).toBe(true);
++  });
++
++  it("throws when the given arg has no consumers", () => {
++    // x30 is a dead write: nothing reads it, so it never appears as a key in consumersOf.
++    const x30 = nodes[indexOf("x30")];
++    expect(() => isNodeFinalConsumerOf(x30, "x30", nodeIndexOf, consumersOf, [])).toThrow();
++  });
++
++  it("throws when the node itself cannot be found in nodeIndexOf", () => {
++    const bogusNode = {
++      ...nodes[indexOf("x3")],
++      name: ["does-not-exist"],
++    } as unknown as CryptOpt.StringOperation;
++    expect(() => isNodeFinalConsumerOf(bogusNode, "x1", nodeIndexOf, consumersOf, [])).toThrow();
++  });
++});
++
++describe("getAllSchedulable", () => {
++  const nodes = makeExampleDfg();
++  const nodeIndexOf = nodeLookupMap(nodes);
++  const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
++
++  it("only offers up the nodes with no unscheduled dependencies, from the start", () => {
++    // x1 and x2 read directly from arg1, so they're immediately schedulable; everything
++    // else transitively depends on one of them.
++    const toBeScheduled = new Set(nodes.keys());
++    const schedulable = getAllSchedulable(toBeScheduled, nodes, consumersOf).sort();
++    expect(schedulable).toEqual([indexOf("x1"), indexOf("x2")].sort());
++  });
++
++  it("unlocks the direct consumers of a node once it's no longer pending", () => {
++    // Once x1 and x2 are scheduled (i.e., removed from toBeScheduled), x3 (which needs both)
++    // and out1[1]/out1[0] (which each need just one of them) all become schedulable; x5
++    // stays blocked since it still needs x3.
++    const toBeScheduled = new Set(nodes.keys());
++    toBeScheduled.delete(indexOf("x1"));
++    toBeScheduled.delete(indexOf("x2"));
++    const schedulable = getAllSchedulable(toBeScheduled, nodes, consumersOf).sort();
++    expect(schedulable).toEqual([indexOf("x3"), indexOf("out1[1]"), indexOf("out1[0]")].sort());
++  });
++
++  it("only offers up x5 (not x6) when both are still pending, since x6 needs x5", () => {
++    const toBeScheduled = new Set([indexOf("x5"), indexOf("x6")]);
++    expect(getAllSchedulable(toBeScheduled, nodes, consumersOf)).toEqual([indexOf("x5")]);
++  });
++
++  it("returns an empty list when there's nothing left to schedule", () => {
++    expect(getAllSchedulable(new Set(), nodes, consumersOf)).toEqual([]);
++  });
++});
++
++describe("computeSchedulingCost", () => {
++  const nodes = makeExampleDfg();
++  const nodeIndexOf = nodeLookupMap(nodes);
++  const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
++
++  it.each([
++    ["x1", 1],
++    ["x2", 1],
++    ["x3", 2],
++    ["x5", -1],
++    ["x6", 0],
++    ["x30", -1],
++  ] as const)("%s: born - freed = %i", (name, expectedCost) => {
++    const idx = indexOf(name);
++    expect(computeSchedulingCost(nodes[idx], nodes, nodeIndexOf, consumersOf, [])).toBe(expectedCost);
++  });
++});
++
++function assertValidTopologicalOrder(
++  order: number[],
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  nodeIndexOf: ReadonlyMap<string, number>,
++) {
++  expect(order.length).toBe(nodes.length);
++  expect(new Set(order).size).toBe(nodes.length);
++
++  const positionOf = new Map(order.map((nodeIdx, position) => [nodeIdx, position]));
++  nodes.forEach((node, nodeIdx) => {
++    node.arguments.forEach((arg) => {
++      const producerIdx = nodeIndexOf.get(arg);
++      if (producerIdx === undefined || producerIdx === nodeIdx) return;
++      expect(positionOf.get(producerIdx)!).toBeLessThan(positionOf.get(nodeIdx)!);
++    });
++  });
++}
++
++describe("reorderPressureMinimizing", () => {
++  it.each([1, 2, 3, 4])("produces a valid topological order at lookaheadFactor: %i", (lookaheadFactor) => {
++    const nodes = makeExampleDfg();
++    const nodeIndexOf = nodeLookupMap(nodes);
++    const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++
++    const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor });
++    assertValidTopologicalOrder(order, nodes, nodeIndexOf);
++  });
++
++  it("doesn't throw when lookaheadFactor exceeds the number of nodes", () => {
++    const nodes = makeExampleDfg();
++    const nodeIndexOf = nodeLookupMap(nodes);
++    const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++
++    const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, {
++      lookaheadFactor: nodes.length + 10,
++    });
++    assertValidTopologicalOrder(order, nodes, nodeIndexOf);
++  });
++
++  it("rejects a lookaheadFactor below 1", () => {
++    const nodes = makeExampleDfg();
++    const nodeIndexOf = nodeLookupMap(nodes);
++    const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++
++    expect(() =>
++      reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor: 0 }),
++    ).toThrow();
++  });
++
++  it("throws when the dependency graph is malformed (nothing schedulable but nodes remain)", () => {
++    const n = (name: string[], operation: string, args: string[], datatype = "u64") =>
++      ({
++        datatype,
++        operation,
++        name,
++        arguments: args,
++        decisions: {},
++        decisionsHot: [],
++      }) as unknown as CryptOpt.StringOperation;
++    const cyclicNodes = [n(["x1"], "+", ["x2", "x2"]), n(["x2"], "+", ["x1", "x1"])];
++    const nodeIndexOf = nodeLookupMap(cyclicNodes);
++    const consumersOf = createDependencyRelation(cyclicNodes, nodeIndexOf);
++    expect(() => reorderPressureMinimizing(cyclicNodes, nodeIndexOf, consumersOf)).toThrow();
++  });
++
++  describe("lookahead changes the chosen order", () => {
++    function makeLookaheadDfg(): CryptOpt.StringOperation[] {
++      const n = (name: string[], operation: string, args: string[], datatype = "u64") =>
++        ({
++          datatype,
++          operation,
++          name,
++          arguments: args,
++          decisions: {},
++          decisionsHot: [],
++        }) as unknown as CryptOpt.StringOperation;
++      return [
++        n(["x11"], "+", ["arg1[2]", "arg1[3]"]),
++        n(["x12"], "+", ["arg1[0]", "arg1[1]"]),
++        n(["x13"], "+", ["x12", "arg1[4]"]),
++        n(["x14"], "+", ["x11", "arg1[5]"]),
++        n(["x15"], "+", ["x14", "x14"]),
++      ];
++    }
++
++    it("picks x11 first at lookaheadFactor: 1", () => {
++      const nodes = makeLookaheadDfg();
++      const nodeIndexOf = nodeLookupMap(nodes);
++      const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++      const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
++
++      const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor: 1 });
++      expect(order[0]).toBe(indexOf("x11"));
++    });
++
++    it("picks x12 first at lookaheadFactor: 2, since it leads to a better second step", () => {
++      const nodes = makeLookaheadDfg();
++      const nodeIndexOf = nodeLookupMap(nodes);
++      const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
++      const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
++
++      const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor: 2 });
++      expect(order[0]).toBe(indexOf("x12"));
++    });
++  });
++});
+diff --git a/test/test-helpers.ts b/test/test-helpers.ts
+index e711d5d..5de814a 100644
+--- a/test/test-helpers.ts
++++ b/test/test-helpers.ts
+@@ -52,6 +52,8 @@ export function getTestArgs(filename: string): OptimizerArgs {
+     redzone: true,
+     framePointer: "omit",
+     memoryConstraints: "none",
++    schedulingAlgorithm: "default",
++    pmLookahead: 1,
+   };
+ }
+

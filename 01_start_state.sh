@@ -12,4 +12,4 @@ for _ in 1 2 3; do
   seed=$((16#${seed:0:8} % 10000))
 done
 
-python3 "$SCRIPT_DIR/gen_starting_states.py" --lookahead 1,2,3 --seed "$seed" "$@"
+python3 "$SCRIPT_DIR/gen_starting_states.py" --seed "$seed" "$@"

@@ -204,7 +204,7 @@ def parse_args():
     )
     parser.add_argument(
         "--out-dir",
-        default=str(SCRIPT_ROOT / "artifacts"),
+        default=str(SCRIPT_ROOT / "artifacts_start_states"),
         help="Directory to store generated JSON/asm/cycle artifacts",
     )
     parser.add_argument(

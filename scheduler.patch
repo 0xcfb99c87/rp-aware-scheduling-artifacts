@@ -5,13 +5,13 @@ index e92e509..9111ce3 100644
 @@ -32,9 +32,9 @@ $(NODE):
  	curl -L https://nodejs.org/dist/v$(NODE_VERSION)/node-v$(NODE_VERSION)-linux-x64.tar.xz | tar --extract --xz --directory ./bins
  	mv -f ./bins/node-v$(NODE_VERSION)-linux-x64 "$(NODE_DIR)"
-
+ 
 -node_modules: 
 +node_modules:
  	@echo "Installing dependencies"
 -	@CFLAGS="-I$(NODE_DIR)/include" PATH=$(PATH) npm $$(test -e ./package-lock.json && echo 'clean-install' || echo "install")
 +	@CFLAGS="-I$(NODE_DIR)/include -Wno-error=incompatible-pointer-types" PATH=$(PATH) npm $$(test -e ./package-lock.json && echo 'clean-install' || echo "install")
-
+ 
  FIAT_DATA_DIR=src/bridge/fiat-bridge/data
  FIAT_CHECKSUMS=$(FIAT_DATA_DIR)/sha256sums
 diff --git a/rollup.config.js b/rollup.config.js
@@ -19,7 +19,7 @@ index 2fe3fbf..c3baf93 100644
 --- a/rollup.config.js
 +++ b/rollup.config.js
 @@ -21,7 +21,7 @@ const external = [
-
+ 
  export default [
    {
 -    input: ["src/CryptOpt.ts", "src/CountCycle.ts"],
@@ -98,7 +98,7 @@ index df0b9d7..bc76cde 100644
 +      pmLookahead: 1,
      }).measuresuite;
    }
-
+ 
 @@ -181,6 +184,9 @@ function createMS(
      cFile: cFilename,
      seed,
@@ -108,7 +108,26 @@ index df0b9d7..bc76cde 100644
 +    pmLookahead: 1,
    }).measuresuite;
  }
-
+ 
+diff --git a/src/CryptOpt.ts b/src/CryptOpt.ts
+index 4e04b47..3875d4f 100644
+--- a/src/CryptOpt.ts
++++ b/src/CryptOpt.ts
+@@ -74,6 +74,14 @@ else if (parsedArgsFromCli.readState) {
+   if (stateFile.parsedArgs) {
+     parsedArgs = stateFile.parsedArgs;
+   }
++  // restore some
++  parsedArgs.single = true;
++  parsedArgs.readState = parsedArgsFromCli.readState;
++  parsedArgs.resultDir = parsedArgsFromCli.resultDir;
++  parsedArgs.evals = parsedArgsFromCli.evals;
++  parsedArgs.proof = parsedArgsFromCli.proof;
++  // order is overwritten in Model.import from statefile json anyways, just force the scheduling algorithm to default here.
++  parsedArgs.schedulingAlgorithm = "default";
+ }
+ 
+ const { single, bets, betRatio, curve, method, verbose } = parsedArgs;
 diff --git a/src/GenerateStartState.ts b/src/GenerateStartState.ts
 new file mode 100644
 index 0000000..0716e8c
@@ -157,7 +176,7 @@ index 0c455bc..8dc1e03 100644
 @@ -30,7 +30,12 @@ import {
  } from "@/bridge/fiat-bridge/constants";
  import { errorOut, ERRORS } from "@/errors";
-
+ 
 -import { FRAME_POINTER_OPTIONS, MEMORY_CONSTRAINTS_OPTIONS, ParsedArgsT } from "../types";
 +import {
 +  FRAME_POINTER_OPTIONS,
@@ -165,9 +184,9 @@ index 0c455bc..8dc1e03 100644
 +  ParsedArgsT,
 +  SCHEDULING_ALGORITHM_OPTIONS,
 +} from "../types";
-
+ 
  const y = await yargs(process.argv.slice(2));
-
+ 
 @@ -137,6 +142,18 @@ export const parsedArgs = y
        "If this is set, CryptOpt will prefer spilling into vector registers as long as they are available, then start spilling into memory. Must specify --xmm switch, too. It will not try to optimize on it. (i.e. The first 16 values to be spilled will be spilled into XMMs, the rest into memory.)",
      boolean: true,
@@ -212,16 +231,16 @@ index 0755b10..5fb7589 100644
  import { BIAS, Paul } from "@/paul";
 -import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T } from "@/types";
 +import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T, SCHEDULING_ALGORITHM_OPTIONS_T } from "@/types";
-
+ 
 -import { createDependencyRelation, nodeLookupMap } from "./model.helper";
 +import { createDependencyRelation, nodeLookupMap, reorderPressureMinimizing } from "./model.helper";
-
+ 
  type methodParam = CryptOpt.Function["arguments"][number] | CryptOpt.Function["returns"][number];
  export class Model {
 @@ -100,12 +100,22 @@ export class Model {
      process.stdout.write(`\nWrote ${cy}${filename}${re} `);
    }
-
+ 
 -  public static import(filename: fs.PathLike) {
 +  public static import(filename: fs.PathLike, json?: CryptOpt.Function) {
      const parsed = JSON.parse(fs.readFileSync(filename).toString());
@@ -278,10 +297,10 @@ index 0755b10..5fb7589 100644
      Logger.log(
        Model.nodesInTopologicalOrder
 diff --git a/src/model/model.helper.ts b/src/model/model.helper.ts
-index 9855964..64d463c 100644
+index 9855964..a1cd75e 100644
 --- a/src/model/model.helper.ts
 +++ b/src/model/model.helper.ts
-@@ -21,7 +21,11 @@ import {
+@@ -21,8 +21,13 @@ import {
    limbify,
    limbifyImm,
    makeU64NameLimbs,
@@ -291,9 +310,11 @@ index 9855964..64d463c 100644
 +  isXD,
 +  isADependentOnB,
  } from "@/helper";
++import { Paul } from "@/paul";
  import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T, Nodes } from "@/types";
-
-@@ -299,3 +303,234 @@ function groupDepLimbs(
+ 
+ /**
+@@ -299,3 +304,249 @@ function groupDepLimbs(
      }
    }
  }
@@ -391,6 +412,8 @@ index 9855964..64d463c 100644
 +  let bestNodeIdx = schedulable[0];
 +  let bestTotalCost = Infinity;
 +
++  const totalCosts = new Map(schedulable.map((candidateIdx) => [candidateIdx, 1]));
++
 +  for (const candidateIdx of schedulable) {
 +    const cost = immediateCosts.get(candidateIdx)!;
 +
@@ -414,16 +437,26 @@ index 9855964..64d463c 100644
 +    toBeScheduled.add(candidateIdx);
 +
 +    const totalCost = cost + restCost;
++    totalCosts.set(candidateIdx, totalCost);
 +    if (totalCost < bestTotalCost) {
 +      bestTotalCost = totalCost;
 +      bestNodeIdx = candidateIdx;
 +    }
 +  }
 +
++  const eligible = Array.from(totalCosts).filter((candidate) => candidate[1] == bestTotalCost);
++  const idx = Paul.chooseBetween(eligible.length);
++  bestNodeIdx = eligible[idx][0];
++  bestTotalCost = eligible[idx][1];
++
 +  const result = { nodeIdx: bestNodeIdx, totalCost: bestTotalCost };
 +  cache.set(cacheKey, result);
++
 +  return result;
 +}
++
++
++
 +
 +// Used for keying memoization hashmap in main scheduling loop.
 +function computeCacheKey(toBeScheduled: ReadonlySet<number>, depth: number): bigint {
@@ -433,6 +466,9 @@ index 9855964..64d463c 100644
 +  }
 +  return (mask << 32n) | BigInt(depth);
 +}
++
++
++
 +
 +// Returns a list of schedulable operations, based upon all toBeScheduled operations.
 +export function getAllSchedulable(
@@ -535,7 +571,7 @@ index 1843b54..f474a67 100644
 @@ -25,7 +25,10 @@ import { ManualBridge } from "@/bridge/manual-bridge";
  import { Model } from "@/model";
  import { OptimizerArgs } from "@/types";
-
+ 
 -type needComms = Pick<OptimizerArgs, "bridge" | "seed" | "memoryConstraints">;
 +type needComms = Pick<
 +  OptimizerArgs,
@@ -551,7 +587,7 @@ index 1843b54..f474a67 100644
 +    schedulingAlgorithm: args.schedulingAlgorithm,
 +    pmLookahead: args.pmLookahead,
    });
-
+ 
    const symbolname = bridge.machinecode(sharedObjectFilename, args.method, args.curve);
 @@ -77,6 +82,8 @@ function initBitcoinCore(sharedObjectFilename: string, args: needBitcoinCore): r
    Model.init({
@@ -560,7 +596,7 @@ index 1843b54..f474a67 100644
 +    schedulingAlgorithm: args.schedulingAlgorithm,
 +    pmLookahead: args.pmLookahead,
    });
-
+ 
    const symbolname = bridge.machinecode(sharedObjectFilename, args.method);
 @@ -95,6 +102,8 @@ function initJasmin(sharedObjectFilename: string, args: needJasmin): ret {
    Model.init({
@@ -569,7 +605,7 @@ index 1843b54..f474a67 100644
 +    schedulingAlgorithm: args.schedulingAlgorithm,
 +    pmLookahead: args.pmLookahead,
    });
-
+ 
    const symbolname = bridge.machinecode(sharedObjectFilename);
 @@ -118,6 +127,8 @@ function initManual(sharedObjectFilename: string, args: needManual): ret {
    Model.init({
@@ -587,7 +623,7 @@ index aabb8ae..73fbcc6 100644
 @@ -32,6 +32,9 @@ export type FRAME_POINTER_OPTIONS_T = (typeof FRAME_POINTER_OPTIONS)[number];
  export const MEMORY_CONSTRAINTS_OPTIONS = ["none", "all", "out1-arg1"] as const;
  export type MEMORY_CONSTRAINTS_OPTIONS_T = (typeof MEMORY_CONSTRAINTS_OPTIONS)[number];
-
+ 
 +export const SCHEDULING_ALGORITHM_OPTIONS = ["default", "pressure-minimized"] as const;
 +export type SCHEDULING_ALGORITHM_OPTIONS_T = (typeof SCHEDULING_ALGORITHM_OPTIONS)[number];
 +
@@ -608,7 +644,7 @@ index eebd586..6b5026c 100644
 +  MEMORY_CONSTRAINTS_OPTIONS_T,
 +  SCHEDULING_ALGORITHM_OPTIONS_T,
 +} from "@/types";
-
+ 
  export type OptimizerArgs = {
    evals: number;
 @@ -37,6 +41,8 @@ export type OptimizerArgs = {
@@ -944,4 +980,4 @@ index e711d5d..5de814a 100644
 +    pmLookahead: 1,
    };
  }
-
+ 

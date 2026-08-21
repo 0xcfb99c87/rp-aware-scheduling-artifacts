@@ -109,7 +109,7 @@ def generate_state(
 
 
 def assemble(state_path: Path, node: str, path: Path) -> None:
-    stdout = run_node(DIST / "Assemble.js", ["--readState", str(state_path)], node)
+    stdout = run_node(DIST / "Assemble.js", ["--readState", str(state_path.absolute())], node)
     if "GLOBAL" not in stdout:
         raise StepFailed(
             f"Assemble.js output for {state_path} has no GLOBAL symbol line (asm looks empty/broken)"
@@ -125,7 +125,7 @@ def count_cycles(
         raw = cache_path.read_text().strip()
     else:
         env = {**os.environ, "CC": "clang"}
-        raw = run_node(DIST / "CountCycle.js", [str(asm_path)], node, env=env).strip()
+        raw = run_node(DIST / "CountCycle.js", [str(asm_path.absolute())], node, env=env).strip()
         if not raw:
             raise StepFailed(
                 f"CountCycle.js produced no output for {asm_path} (likely couldn't get a stable measurement)"

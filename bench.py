@@ -82,7 +82,9 @@ def discover_runs(root: str, base_dir: str) -> list[dict]:
         runs.append(
             {
                 "readState": str(path.absolute()),
-                "resultDir": os.path.join(base_dir, make_run_id(state)),
+                "resultDir": os.path.abspath(
+                    os.path.join(base_dir, make_run_id(state))
+                ),
             }
         )
     return runs

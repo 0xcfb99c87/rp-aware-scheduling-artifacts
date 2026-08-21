@@ -275,8 +275,8 @@ def main() -> int:
                     # CountCycle.js requires the asm filename to match /seed[0-9]+_ratio[0-9]+\.asm/, just add a dummy digit at the end.
                     asm_path = base / f"{name}_seed{seed}_ratio0.asm"
                     cycles_cache_path = base / f"{name}.cycles"
+                    elapsed_cache_path = base / f"{name}.elapsed_ms"
 
-                    elapsed_ms = None
                     if args.force or not state_path.exists():
                         t0 = time.monotonic()
                         generate_state(
@@ -289,6 +289,11 @@ def main() -> int:
                             state_path,
                         )
                         elapsed_ms = (time.monotonic() - t0) * 1000
+                        elapsed_cache_path.write_text(f"{elapsed_ms}\n")
+                    elif elapsed_cache_path.exists():
+                        elapsed_ms = float(elapsed_cache_path.read_text().strip())
+                    else:
+                        elapsed_ms = None
 
                     if args.force or not asm_path.exists():
                         assemble(state_path, args.node, asm_path)

@@ -297,7 +297,7 @@ index 0755b10..5fb7589 100644
      Logger.log(
        Model.nodesInTopologicalOrder
 diff --git a/src/model/model.helper.ts b/src/model/model.helper.ts
-index 9855964..a1cd75e 100644
+index 9855964..4fb7a4c 100644
 --- a/src/model/model.helper.ts
 +++ b/src/model/model.helper.ts
 @@ -21,8 +21,13 @@ import {
@@ -412,7 +412,7 @@ index 9855964..a1cd75e 100644
 +  let bestNodeIdx = schedulable[0];
 +  let bestTotalCost = Infinity;
 +
-+  const totalCosts = new Map(schedulable.map((candidateIdx) => [candidateIdx, 1]));
++  // const totalCosts = new Map(schedulable.map((candidateIdx) => [candidateIdx, 1]));
 +
 +  for (const candidateIdx of schedulable) {
 +    const cost = immediateCosts.get(candidateIdx)!;
@@ -437,17 +437,17 @@ index 9855964..a1cd75e 100644
 +    toBeScheduled.add(candidateIdx);
 +
 +    const totalCost = cost + restCost;
-+    totalCosts.set(candidateIdx, totalCost);
++    // totalCosts.set(candidateIdx, totalCost);
 +    if (totalCost < bestTotalCost) {
 +      bestTotalCost = totalCost;
 +      bestNodeIdx = candidateIdx;
 +    }
 +  }
 +
-+  const eligible = Array.from(totalCosts).filter((candidate) => candidate[1] == bestTotalCost);
-+  const idx = Paul.chooseBetween(eligible.length);
-+  bestNodeIdx = eligible[idx][0];
-+  bestTotalCost = eligible[idx][1];
++  // const eligible = Array.from(totalCosts).filter((candidate) => candidate[1] == bestTotalCost);
++  // const idx = Paul.chooseBetween(eligible.length);
++  // bestNodeIdx = eligible[idx][0];
++  // bestTotalCost = eligible[idx][1];
 +
 +  const result = { nodeIdx: bestNodeIdx, totalCost: bestTotalCost };
 +  cache.set(cacheKey, result);

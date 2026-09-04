@@ -82,19 +82,19 @@ written to `./artifacts_start_state/seed<seed>.csv`.
 The script `./bench.py` allows for taking the starting states generated in the
 previous step and optimizing them further with CryptOpt, in order to compare
 the impact of each scheduler on optimization trajectory. Assuming that your
-starting states live in `./artifacts_start_state` you can run:
+starting states live in `./artifacts_start_states` you can run:
 
 ```bash
-python3 ./bench.py -j 3 -e 100k ./artifacts_start_state
+python3 ./bench.py -j 3 -e 100k ./artifacts_start_states
 ```
 
 This will optimize each starting state for 100k additional mutations in
 parallel batches of 3 (following the same methodology as in the original
 CryptOpt paper). By default, this will take a long time (easily over 12
 wall-clock hours). You can speed up this process by (1) increasing the parallel
-batch size, (2) reducing the number of evaluations, or *c)* disabling
-CryptOpt's verified correctness checking by passing `--no-proof`. The command
-above reflects the configuration used to achieve the results in the paper.
+batch size, (2) reducing the number of evaluations, or (3) disabling CryptOpt's
+verified correctness checking by passing `--no-proof`. The command above
+reflects the configuration used to achieve the results in the paper.
 
 ## AUCurves Case Study
 

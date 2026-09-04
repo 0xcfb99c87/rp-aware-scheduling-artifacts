@@ -297,7 +297,7 @@ index 0755b10..5fb7589 100644
      Logger.log(
        Model.nodesInTopologicalOrder
 diff --git a/src/model/model.helper.ts b/src/model/model.helper.ts
-index 9855964..4fb7a4c 100644
+index 9855964..6f09cc2 100644
 --- a/src/model/model.helper.ts
 +++ b/src/model/model.helper.ts
 @@ -21,8 +21,13 @@ import {
@@ -314,7 +314,7 @@ index 9855964..4fb7a4c 100644
  import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T, Nodes } from "@/types";
  
  /**
-@@ -299,3 +304,249 @@ function groupDepLimbs(
+@@ -299,3 +304,264 @@ function groupDepLimbs(
      }
    }
  }
@@ -411,6 +411,27 @@ index 9855964..4fb7a4c 100644
 +
 +  let bestNodeIdx = schedulable[0];
 +  let bestTotalCost = Infinity;
++  let bestNodeLatencyEstimate = Infinity;
++
++  const getLatency = (node: CryptOpt.StringOperation) => {
++    switch (node.operation) {
++      case "*":
++        return 3;
++      case "mulx":
++        return 3;
++      case "shrd":
++        return 0.5;
++      case "sar":
++        return 0.5;
++      case "ror":
++        return 0.5;
++      case "<<":
++        return 0.5;
++      case ">>":
++        return 0.5;
++    }
++    return 1;
++  };
 +
 +  // const totalCosts = new Map(schedulable.map((candidateIdx) => [candidateIdx, 1]));
 +
@@ -435,12 +456,12 @@ index 9855964..4fb7a4c 100644
 +
 +    scheduled.pop();
 +    toBeScheduled.add(candidateIdx);
-+
++    const lat = getLatency(nodes[candidateIdx]);
 +    const totalCost = cost + restCost;
-+    // totalCosts.set(candidateIdx, totalCost);
-+    if (totalCost < bestTotalCost) {
++    if (totalCost < bestTotalCost || (totalCost == bestTotalCost && lat > bestNodeLatencyEstimate)) {
 +      bestTotalCost = totalCost;
 +      bestNodeIdx = candidateIdx;
++      bestNodeLatencyEstimate = lat;
 +    }
 +  }
 +
@@ -455,9 +476,6 @@ index 9855964..4fb7a4c 100644
 +  return result;
 +}
 +
-+
-+
-+
 +// Used for keying memoization hashmap in main scheduling loop.
 +function computeCacheKey(toBeScheduled: ReadonlySet<number>, depth: number): bigint {
 +  let mask = 0n;
@@ -466,9 +484,6 @@ index 9855964..4fb7a4c 100644
 +  }
 +  return (mask << 32n) | BigInt(depth);
 +}
-+
-+
-+
 +
 +// Returns a list of schedulable operations, based upon all toBeScheduled operations.
 +export function getAllSchedulable(

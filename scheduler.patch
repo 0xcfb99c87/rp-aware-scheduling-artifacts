@@ -297,7 +297,7 @@ index 0755b10..5fb7589 100644
      Logger.log(
        Model.nodesInTopologicalOrder
 diff --git a/src/model/model.helper.ts b/src/model/model.helper.ts
-index 9855964..6f09cc2 100644
+index 9855964..9107aa8 100644
 --- a/src/model/model.helper.ts
 +++ b/src/model/model.helper.ts
 @@ -21,8 +21,13 @@ import {
@@ -314,7 +314,7 @@ index 9855964..6f09cc2 100644
  import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T, Nodes } from "@/types";
  
  /**
-@@ -299,3 +304,264 @@ function groupDepLimbs(
+@@ -299,3 +304,323 @@ function groupDepLimbs(
      }
    }
  }
@@ -341,6 +341,10 @@ index 9855964..6f09cc2 100644
 +  const lookaheadFactor = options?.lookaheadFactor ?? 1;
 +  if (lookaheadFactor < 1) throw new Error(`invalid lookahead factor: ${lookaheadFactor}`);
 +
++  // Independent of the partial schedule, so it is computed once up front and only
++  // read (as a tie-breaker) inside the scheduling loop.
++  const criticalPathLengths = computeCriticalPathLengths(nodes, nodeIndexOf, consumersOf);
++
 +  // Memoize results from bestSchedulableCandidate, using partial schedule + depth as key.
 +  const cache = new Map<bigint, { nodeIdx: number; totalCost: number }>();
 +
@@ -353,6 +357,7 @@ index 9855964..6f09cc2 100644
 +      nodes,
 +      nodeIndexOf,
 +      consumersOf,
++      criticalPathLengths,
 +      cache,
 +    );
 +    if (result === undefined) {
@@ -379,6 +384,76 @@ index 9855964..6f09cc2 100644
 +  return born - freed;
 +}
 +
++// Hard-coded instruction latencies (in cycles) used for the critical-path computation.
++const MULTIPLICATION_LATENCY = 3;
++const DEFAULT_LATENCY = 1;
++
++// Multiplications are assumed to take MULTIPLICATION_LATENCY cycles, everything else
++// (additions, shifts, moves, ...) DEFAULT_LATENCY.
++export function operationLatency(operation: CryptOpt.Operation_T): number {
++  return operation === "*" || operation === "mulx" ? MULTIPLICATION_LATENCY : DEFAULT_LATENCY;
++}
++
++// Returns, for each node, the length (in cycles) of the longest latency-weighted path from
++// that node to any sink of the dependency graph, including the node's own latency. That is
++// the earliest cycle in which the whole computation below that node can be finished, so a
++// bigger value means the node is more urgent to schedule.
++export function computeCriticalPathLengths(
++  nodes: ReadonlyArray<CryptOpt.StringOperation>,
++  nodeIndexOf: ReadonlyMap<string, number>,
++  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++): number[] {
++  // Node-level successor relation, derived from the limb-level consumersOf.
++  const successorsOf = nodes.map((node, nodeIdx) => {
++    const successors = new Set<number>();
++    makeU64NameLimbs(node).forEach((limb) => {
++      consumersOf.get(limb)?.forEach((consumer) => {
++        const consumerIdx = nodeIndexOf.get(consumer);
++        // A node consuming its own limb (e.g. the hi limb of a u128 it produces) is no edge.
++        if (consumerIdx !== undefined && consumerIdx !== nodeIdx) {
++          successors.add(consumerIdx);
++        }
++      });
++    });
++    return [...successors];
++  });
++
++  const UNVISITED = 0;
++  const ON_STACK = 1;
++  const DONE = 2;
++  const state = new Uint8Array(nodes.length);
++  const lengths = new Array<number>(nodes.length).fill(0);
++
++  // Iterative (rather than recursive) post-order DFS, since the graphs can get deep.
++  // Back edges, which only occur on a malformed/cyclic graph, contribute nothing, so that
++  // such a graph is still reported by the scheduling loop rather than hanging in here.
++  for (let root = 0; root < nodes.length; root++) {
++    if (state[root] !== UNVISITED) continue;
++    const stack = [root];
++    while (stack.length > 0) {
++      const nodeIdx = stack[stack.length - 1];
++      if (state[nodeIdx] === UNVISITED) {
++        state[nodeIdx] = ON_STACK;
++        successorsOf[nodeIdx].forEach((successor) => {
++          if (state[successor] === UNVISITED) stack.push(successor);
++        });
++        continue;
++      }
++      stack.pop();
++      // Already finished via another path (a node may be stacked more than once).
++      if (state[nodeIdx] === DONE) continue;
++      const longestSuccessor = successorsOf[nodeIdx].reduce(
++        (acc, successor) => Math.max(acc, state[successor] === DONE ? lengths[successor] : 0),
++        0,
++      );
++      lengths[nodeIdx] = operationLatency(nodes[nodeIdx].operation) + longestSuccessor;
++      state[nodeIdx] = DONE;
++    }
++  }
++
++  return lengths;
++}
++
 +// Recursively determines which currently schedulable candidate minimizes the total
 +// scheduling cost over up to `depth` steps (this candidate's own cost, plus the best
 +// achievable cost of the following `depth - 1` steps).
@@ -389,6 +464,8 @@ index 9855964..6f09cc2 100644
 +  nodes: ReadonlyArray<CryptOpt.StringOperation>,
 +  nodeIndexOf: ReadonlyMap<string, number>,
 +  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
++  // Per node index, its latency-weighted longest path to a sink; used to break cost ties.
++  criticalPathLengths: ReadonlyArray<number>,
 +  cache: Map<bigint, { nodeIdx: number; totalCost: number }>,
 +): { nodeIdx: number; totalCost: number } | undefined {
 +  if (toBeScheduled.size === 0) return undefined;
@@ -411,27 +488,6 @@ index 9855964..6f09cc2 100644
 +
 +  let bestNodeIdx = schedulable[0];
 +  let bestTotalCost = Infinity;
-+  let bestNodeLatencyEstimate = Infinity;
-+
-+  const getLatency = (node: CryptOpt.StringOperation) => {
-+    switch (node.operation) {
-+      case "*":
-+        return 3;
-+      case "mulx":
-+        return 3;
-+      case "shrd":
-+        return 0.5;
-+      case "sar":
-+        return 0.5;
-+      case "ror":
-+        return 0.5;
-+      case "<<":
-+        return 0.5;
-+      case ">>":
-+        return 0.5;
-+    }
-+    return 1;
-+  };
 +
 +  // const totalCosts = new Map(schedulable.map((candidateIdx) => [candidateIdx, 1]));
 +
@@ -450,18 +506,21 @@ index 9855964..6f09cc2 100644
 +            nodes,
 +            nodeIndexOf,
 +            consumersOf,
++            criticalPathLengths,
 +            cache,
 +          )?.totalCost ?? 0
 +        : 0;
 +
 +    scheduled.pop();
 +    toBeScheduled.add(candidateIdx);
-+    const lat = getLatency(nodes[candidateIdx]);
 +    const totalCost = cost + restCost;
-+    if (totalCost < bestTotalCost || (totalCost == bestTotalCost && lat > bestNodeLatencyEstimate)) {
++    // On equal cost, prefer the candidate on the longer critical path.
++    if (
++      totalCost < bestTotalCost ||
++      (totalCost == bestTotalCost && criticalPathLengths[candidateIdx] > criticalPathLengths[bestNodeIdx])
++    ) {
 +      bestTotalCost = totalCost;
 +      bestNodeIdx = candidateIdx;
-+      bestNodeLatencyEstimate = lat;
 +    }
 +  }
 +

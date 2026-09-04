@@ -37,7 +37,6 @@ CSV_HEADER = [
     "method",
     "seed",
     "scheduling_strategy",
-    "pm_lookahead",
     "cycles_cc_baseline",
     "cycles_cryptopt",
     "scheduling_time_elapsed_ms",
@@ -77,7 +76,6 @@ def generate_state(
     curve: str,
     method: str,
     scheduler: str,
-    lookahead: int,
     seed: int,
     node: str,
     path: Path,
@@ -87,8 +85,6 @@ def generate_state(
         str(seed),
         "--schedulingAlgorithm",
         scheduler,
-        "--pmLookahead",
-        str(lookahead),
         "-c",
         curve,
         "-m",
@@ -106,7 +102,9 @@ def generate_state(
 
 
 def assemble(state_path: Path, node: str, path: Path) -> None:
-    stdout = run_node(DIST / "Assemble.js", ["--readState", str(state_path.absolute())], node)
+    stdout = run_node(
+        DIST / "Assemble.js", ["--readState", str(state_path.absolute())], node
+    )
     if "GLOBAL" not in stdout:
         raise StepFailed(
             f"Assemble.js output for {state_path} has no GLOBAL symbol line (asm looks empty/broken)"
@@ -122,7 +120,9 @@ def count_cycles(
         raw = cache_path.read_text().strip()
     else:
         env = {**os.environ, "CC": "clang"}
-        raw = run_node(DIST / "CountCycle.js", [str(asm_path.absolute())], node, env=env).strip()
+        raw = run_node(
+            DIST / "CountCycle.js", [str(asm_path.absolute())], node, env=env
+        ).strip()
         if not raw:
             raise StepFailed(
                 f"CountCycle.js produced no output for {asm_path} (likely couldn't get a stable measurement)"
@@ -191,15 +191,6 @@ def parse_args():
         help="Comma-separated list of methods to run (default: mul,square)",
     )
     parser.add_argument(
-        "--lookahead",
-        default="1",
-        help=(
-            "Comma-separated list of lookahead factors to generate pressure-minimized "
-            "states for (default: 1). The default scheduler is unaffected by lookahead, "
-            "so it is only ever run once regardless of how many values are given here."
-        ),
-    )
-    parser.add_argument(
         "--out-dir",
         default=str(SCRIPT_ROOT / "artifacts_start_states"),
         help="Directory to store generated JSON/asm/cycle artifacts",
@@ -226,9 +217,6 @@ def parse_args():
     for m in [m.strip() for m in args.methods.split(",") if m.strip()]:
         if m not in METHODS:
             parser.error(f"unknown method {m!r}; known methods: {', '.join(METHODS)}")
-    for la in [la.strip() for la in args.lookahead.split(",") if la.strip()]:
-        if not la.isdigit():
-            parser.error(f"invalid lookahead {la!r}; must be a positive integer")
     return parser.parse_args()
 
 
@@ -236,16 +224,11 @@ def main() -> int:
     args = parse_args()
     curves = [c.strip() for c in args.curves.split(",") if c.strip()]
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
-    lookaheads = [int(la.strip()) for la in args.lookahead.split(",") if la.strip()]
     seed = int(args.seed) if args.seed is not None else randint(1, 9999)
     out_dir = Path(args.out_dir)
     csv_out = Path(args.csv_out) if args.csv_out else out_dir / f"seed{seed}.csv"
     csv_out.parent.mkdir(parents=True, exist_ok=True)
-
-    # Lookahead only affects the pressure-minimized scheduler, so "default" is run
-    # once and never multiplied out across the requested lookahead values.
-    runs: list[tuple[str, int | None]] = [("default", None)]
-    runs += [("pressure-minimized", la) for la in lookaheads]
+    runs: list[str] = ["default", "pressure-minimized"]
 
     total = len(curves) * len(methods) * len(runs)
     i = 0
@@ -256,18 +239,15 @@ def main() -> int:
 
         for curve in curves:
             for method in methods:
-                for scheduler, lookahead in runs:
+                for scheduler in runs:
                     i += 1
                     print(
-                        f"[{i}/{total}] curve={curve} method={method} scheduler={scheduler} "
-                        f"seed={seed} lookahead={lookahead if lookahead is not None else 'n/a'}",
+                        f"[{i}/{total}] curve={curve} method={method} scheduler={scheduler} seed={seed}",
                         file=sys.stderr,
                     )
 
                     base = out_dir / f"seed{seed}" / curve / method
                     name = f"{curve}_{method}_{scheduler}"
-                    if lookahead is not None:
-                        name += f"_la{lookahead}"
                     state_path = base / f"{name}.json"
                     # CountCycle.js requires the asm filename to match /seed[0-9]+_ratio[0-9]+\.asm/, just add a dummy digit at the end.
                     asm_path = base / f"{name}_seed{seed}_ratio0.asm"
@@ -280,7 +260,6 @@ def main() -> int:
                             curve,
                             method,
                             scheduler,
-                            lookahead if lookahead is not None else 1,
                             seed,
                             args.node,
                             state_path,
@@ -307,7 +286,6 @@ def main() -> int:
                             method,
                             seed,
                             scheduler,
-                            lookahead if lookahead is not None else 1,
                             cc_baseline_cycles,
                             asm_cycles,
                             elapsed_ms,
@@ -319,7 +297,6 @@ def main() -> int:
 
     print(f"\nWrote {csv_out}", file=sys.stderr)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

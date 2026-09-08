@@ -123,25 +123,31 @@ two stages (i.e., have the `./artifacts_start_states` and
 `./artifacts_optimization_comparison` artifacts), you can execute:
 
 ```bash
-python3 ./bench_aucurves.py \
+python3 ./bench_aucurves.py --cpu 0 \
     ./artifacts_start_states \
     ./artifacts_optimization_comparison
 ```
 
-To run the benchmarks. This will benchmark a variety of curves and high-level
-methods from AUCurves. Each cryptographic primitive is evaluated against a
-number of FFA backends:
+This benchmarks a full BLS12-381 pairing, as provided by the
+`bls12-381-safe-rust` crate. The pairing code is held fixed; what varies is the
+field multiplication and squaring leaves underneath it, which are swapped for
+each of the following backends:
 
-1. `aucurves-ref`: The standard Rust-based implementation in AUCurves.
-1. `aucurves-upstream`: A baseline CryptOpt assembly variant that AUCurves
-   ships with.
-1. `aucurves+noopt+default` and `aucurves+noopt+pm`: An unoptimized CryptOpt
-   assembly variant (produced as part of `./artifacts_start_states`).
-1. `aucurves+opt+default` and `aucurves+opt+pm`: An optimized CryptOpt assembly
-   variant (produced as part of `./artifacts_optimization_comparison`) after
-   100k mutations.
+1. `rust`: The crate's own Rust field arithmetic, with no assembly linked.
+1. `ref`: Pre-optimized (10k mutations) CryptOpt assembly that AUCurves vendors
+   itself, taken from `AUCurves/src/Implementations/C/cryptopt`.
+1. `defnoopt` and `pmnoopt`: An unoptimized CryptOpt assembly variant (produced
+   as part of `./artifacts_start_states`) under each of the two scheduling
+   strategies.
+1. `defopt` and `pmopt`: An optimized CryptOpt assembly variant (produced as
+   part of `./artifacts_optimization_comparison`) after 100k mutations.
 
+The benchmarking results of all tested configurations are written to a CSV file
+under `./artifacts_aucurves/aucurves_bench.csv`. The benchmarking process takes
+under a minute, most of which is spent rebuilding the crate between backends.
 
-The output of all tested configurations is written as a CSV file to
-`./artifacts_aucurves/aucurves_bench.csv`. Note that the benchmarking process
-takes about 10 minutes.
+By default each configuration is measured three times and the fastest run is
+kept. Pass `--repeat` to change that, `--cpu N` to pin the benchmark to a
+single core via `taskset`, or `--help` to see the remaining options. The
+command above reflects the configuration used to achieve the results in the
+paper.

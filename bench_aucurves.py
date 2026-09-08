@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import re
 import shutil
 import subprocess
@@ -14,80 +13,6 @@ from pathlib import Path
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 AUCURVES_ROOT = SCRIPT_ROOT / "AUCurves"
-
-# The `_bls12_mul` / `_bls12_square` symbols are what AUCurves' build.sh links
-# in place of the Rust CIOS leaves in bls12-381-safe-rust/src/stubs.rs.  Its
-# jasmin_aliases.s exists only to bridge the CryptOpt symbol names to those two;
-# we rename the globals in the assembly directly instead, so the alias file is
-# assembled empty.
-JASMIN_ALIASES = """\t.text
-"""
-
-# AUCurves' build.sh also assembles libjade's Jasmin SHAKE-128, which is not
-# shipped in the repository.  The pure-Rust path that the crate falls back on
-# when `cryptopt` is off is itself a stub returning zeros (src/shake128.rs), and
-# the caller pre-zeroes the output buffer, so this stub is equivalent.  No
-# benchmark here touches SHAKE-128.
-SHAKE128_STUB = """\t.text
-\t.globl jade_xof_shake128_amd64_ref
-jade_xof_shake128_amd64_ref:
-\txorl %eax, %eax
-\tret
-"""
-
-TARGETS = {
-    "bls12_381_p": {
-        "crate": "bls12-381-safe-rust",
-        "package": "bls12-381-safe-rust",
-        "operation": "pairing",
-        "archive": "libbls12_leaves.a",
-        # cryptopt method -> (destination under generated/, exported symbol)
-        "leaves": {
-            "mul": ("bls12_mul_cryptopt.asm", "_bls12_mul"),
-            "square": ("bls12_square_cryptopt.asm", "_bls12_square"),
-        },
-        # The CryptOpt assembly AUCurves vendors itself.  This crate's
-        # generated/ ships none; these are the files the C pairing pipeline in
-        # src/Implementations/C/ links (see that directory's README.md).
-        "vendored": {
-            "mul": "src/Implementations/C/cryptopt/fiat_bls12_381_p_mul.asm",
-            "square": "src/Implementations/C/cryptopt/fiat_bls12_381_p_square.asm",
-        },
-        "aux": {"jasmin_aliases.s": JASMIN_ALIASES, "shake128.s": SHAKE128_STUB},
-        "ref_env": {},
-        "metric": ("Pairing:", "us", 1000.0),
-    },
-    "p384": {
-        "crate": "p384-safe-rust",
-        "package": "p384-safe-rust",
-        "operation": "scalarmult",
-        "archive": "libp384_cryptopt.a",
-        "leaves": {
-            "mul": ("p384_mul_cryptopt.asm", "p384_cryptopt_mul"),
-            "square": ("p384_square_cryptopt.asm", "p384_cryptopt_square"),
-        },
-        # Here the vendored files are the crate's own generated/ inputs, already
-        # carrying the renamed symbol; they are read before the run overwrites
-        # them and put back verbatim for the aucurves-upstream measurement.
-        "vendored": {
-            "mul": "p384-safe-rust/generated/p384_mul_cryptopt.asm",
-            "square": "p384-safe-rust/generated/p384_square_cryptopt.asm",
-        },
-        "ref_env": {"P384_NO_CRYPTOPT": "1"},
-        "aux": {},
-        "metric": ("g1_scalar_mul (384-bit)", "ns/op", 1.0),
-    },
-}
-
-# (csv label, kind, scheduling strategy)
-BACKENDS = [
-    ("aucurves-ref", "ref", None),
-    ("aucurves-upstream", "upstream", None),
-    ("aucurves+noopt+default", "noopt", "default"),
-    ("aucurves+noopt+pm", "noopt", "pressure-minimized"),
-    ("aucurves+opt+default", "opt", "default"),
-    ("aucurves+opt+pm", "opt", "pressure-minimized"),
-]
 
 
 def fatal(msg: str) -> None:
@@ -101,7 +26,7 @@ def log(msg: str) -> None:
 
 def detect_seed(start_states: Path) -> str:
     seeds = sorted(
-        p.name[len("seed"):]
+        p.name[len("seed") :]
         for p in start_states.iterdir()
         if p.is_dir() and p.name.startswith("seed")
     )
@@ -113,12 +38,7 @@ def detect_seed(start_states: Path) -> str:
 
 
 def rename_leaf(body: str, curve: str, method: str, symbol: str) -> str:
-    """Point a CryptOpt .asm at the symbol the AUCurves crate links against.
-
-    Only the GLOBAL directive and the label are touched, so provenance comments
-    keep naming the fiat function.  A file already exporting `symbol` (AUCurves'
-    vendored p384 leaves) passes through unchanged.
-    """
+    # AUCurves expects different symbol names than those used in CryptOpt's output.
     fiat = re.escape(f"fiat_{curve}_{method}")
     body = re.sub(rf"^(\s*GLOBAL\s+){fiat}\s*$", rf"\g<1>{symbol}", body, flags=re.M)
     body = re.sub(rf"^{fiat}:", f"{symbol}:", body, flags=re.M)
@@ -127,30 +47,25 @@ def rename_leaf(body: str, curve: str, method: str, symbol: str) -> str:
     return body
 
 
-def read_vendored(curves: list[str]) -> dict[tuple[str, str], tuple[str, str]]:
-    """(curve, method) -> (source filename, assembly ready to install).
-
-    Read up front, because installing an earlier backend overwrites the
-    destination, which for p384 is the vendored file itself.
-    """
-    out = {}
-    for curve in curves:
-        target = TARGETS[curve]
-        for method, (_, symbol) in target["leaves"].items():
-            src = AUCURVES_ROOT / target["vendored"][method]
-            if not src.is_file():
-                fatal(f"missing vendored assembly: {src}")
-            out[(curve, method)] = (src.name, rename_leaf(src.read_text(), curve, method, symbol))
-    return out
-
-
+# Sources assembly to link into AUCurves, depending on the kind requested.
 def source_asm(
-    curve: str, kind: str, strategy: str, method: str,
-    start_states: Path, opt_dir: Path, seed: str,
+    curve: str,
+    vendored: str,
+    kind: str,
+    strategy: str | None,
+    method: str,
+    start_states: Path,
+    opt_dir: Path,
+    seed: str,
 ) -> Path:
-    if kind == "noopt":
+    if kind == "vendored":
+        path = AUCURVES_ROOT / vendored.format(curve=curve, method=method)
+    elif kind == "noopt":
         path = (
-            start_states / f"seed{seed}" / curve / method
+            start_states
+            / f"seed{seed}"
+            / curve
+            / method
             / f"{curve}_{method}_{strategy}_seed{seed}_ratio0.asm"
         )
     else:
@@ -164,126 +79,216 @@ def source_asm(
     return path
 
 
-def install(curve: str, kind: str, strategy: str | None, vendored: dict, *args) -> dict[str, str]:
-    """Write the generated/ files for one backend; return the asm names used."""
-    target = TARGETS[curve]
-    gen = AUCURVES_ROOT / target["crate"] / "generated"
-    used = {}
-
-    for method, (dest, symbol) in target["leaves"].items():
-        if kind == "ref":
-            # No assembly: p384's build.rs is told to skip it via P384_NO_CRYPTOPT,
-            # and bls12-381's build.sh fails on the absent input and falls back to
-            # the Rust leaves, which is the state of a clean AUCurves checkout.
-            (gen / dest).unlink(missing_ok=True)
-            used[method] = "(none)"
-            continue
-        if kind == "upstream":
-            name, body = vendored[(curve, method)]
-        else:
-            src = source_asm(curve, kind, strategy, method, *args)
-            name, body = src.name, rename_leaf(src.read_text(), curve, method, symbol)
-        (gen / dest).write_text(body)
-        used[method] = name
-
-    for name, body in target["aux"].items():
-        if kind == "ref":
-            (gen / name).unlink(missing_ok=True)
-        else:
-            (gen / name).write_text(body)
-
-    return used
+def relink(link: Path, target: Path) -> None:
+    link.unlink(missing_ok=True)
+    link.symlink_to(target)
 
 
-def parse_metric(out: str, label: str, unit: str) -> float | None:
-    for line in out.splitlines():
-        if not line.startswith(label):
-            continue
-        fields = line.split()
-        if unit not in fields:
-            continue
-        return float(fields[fields.index(unit) - 1])
-    return None
+# bench_compare row label -> csv key. Arkworks exposes no miller loop entry
+# point in the shape the other arms use, so those two cells are "-".
+COMPARE_ROWS = {
+    "Fp mul": "fp_mul",
+    "Miller loop": "miller",
+    "Pairing (full)": "pairing",
+}
+COMPARE_COLS = ("cyc", "ns", "blst_cyc", "blst_ns", "ark_cyc", "ark_ns")
 
 
-def run_bench(curve: str, kind: str, cpu: int | None, repeat: int) -> float:
-    target = TARGETS[curve]
-    manifest = AUCURVES_ROOT / target["crate"] / "Cargo.toml"
-    env = dict(os.environ)
-    env.pop("P384_NO_CRYPTOPT", None)
-    if kind == "ref":
-        env.update(target["ref_env"])
+def parse_compare(out: str) -> dict[str, float]:
+    # Only scan the figures table; the ratios table below repeats the row labels.
+    table = out.partition("=== ratios")[0].partition("=== per-arm figures ===")[2]
+    metrics = {}
+    for label, key in COMPARE_ROWS.items():
+        row = next((l for l in table.splitlines() if l.startswith(label)), None)
+        if row is None:
+            fatal(f"no '{label}' row in bench_compare output:\n{out}")
+        cells = row[len(label) :].split()
+        if len(cells) != len(COMPARE_COLS):
+            fatal(f"expected {len(COMPARE_COLS)} cells in '{label}' row, got: {row!r}")
+        metrics.update(
+            {f"{key}_{c}": float(v) for c, v in zip(COMPARE_COLS, cells) if v != "-"}
+        )
+    return metrics
 
-    # Rebuild the crate from scratch so no stale build-script output or leaf
-    # archive from the previous backend can survive into this measurement.
+
+def cargo_bench(package: str, example: str, parse, cpu: int | None) -> dict[str, float]:
+    # Ensure cargo rebuilds from scratch
     subprocess.run(
-        ["cargo", "clean", "--release", "-p", target["package"]],
-        cwd=AUCURVES_ROOT, env=env, check=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ["cargo", "clean", "--release", "-p", package],
+        cwd=AUCURVES_ROOT,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
-    cmd = ["cargo", "run", "--release", "--quiet",
-           "--manifest-path", str(manifest), "--example", "bench"]
+    cmd = [
+        "cargo",
+        "run",
+        "--release",
+        "--quiet",
+        "--manifest-path",
+        str(AUCURVES_ROOT / package / "Cargo.toml"),
+        "--example",
+        example,
+    ]
     if cpu is not None:
         cmd = ["taskset", "-c", str(cpu)] + cmd
 
-    label, unit, scale = target["metric"]
-    best = None
-    for _ in range(repeat):
-        proc = subprocess.run(
-            cmd, cwd=AUCURVES_ROOT, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        if proc.returncode != 0:
-            fatal(f"{curve}/{kind}: bench failed:\n{proc.stderr}")
-        value = parse_metric(proc.stdout, label, unit)
-        if value is None:
-            fatal(f"{curve}/{kind}: no '{label}' line in bench output:\n{proc.stdout}")
-        best = value if best is None else min(best, value)
-
-    # Guard against silently reporting fiat-rust numbers as a CryptOpt backend:
-    # the leaf archive exists if and only if the assembly was linked.
-    archives = list(
-        (AUCURVES_ROOT / "target" / "release" / "build").glob(
-            f"{target['package']}-*/out/{target['archive']}"
-        )
+    # Keep the per-metric minimum, the same rule the example applies internally.
+    proc = subprocess.run(
+        cmd,
+        cwd=AUCURVES_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    if kind == "ref" and archives:
-        fatal(f"{curve}/ref: {target['archive']} was built; assembly leaked in")
-    if kind != "ref" and not archives:
-        fatal(f"{curve}/{kind}: {target['archive']} missing; assembly was not linked")
-
-    return best * scale
+    if proc.returncode != 0:
+        fatal(f"{package}: {example} failed:\n{proc.stderr}")
+    metrics = parse(proc.stdout)
+    return metrics
 
 
-def snapshot(paths: list[Path]) -> dict[Path, bytes | None]:
-    return {p: p.read_bytes() if p.is_file() else None for p in paths}
+def linked_archive(package: str, archive: str) -> bool:
+    build = AUCURVES_ROOT / "target" / "release" / "build"
+    return any(build.glob(f"{package}-*/out/{archive}"))
 
 
-def restore(snap: dict[Path, bytes | None]) -> None:
-    for path, body in snap.items():
-        if body is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.write_bytes(body)
+def bench_bls_pairing(
+    out_dir: Path,
+    start_states: Path,
+    opt_dir: Path,
+    seed: str,
+    cpu: int | None,
+) -> list[dict]:
+    curve = "bls12_381_p"
+    operation = "pairing"
+    package = "bls12-381-safe-rust"
+    archive = "libbls12_leaves.a"
+    generated = AUCURVES_ROOT / package / "generated"
+    # cryptopt method -> symbol the crate links in place of its Rust default impl.
+    leaves = {"mul": "_bls12_mul", "square": "_bls12_square"}
+    # AUCurves vendors some pre-optimized cryptopt itself. They consist of a
+    # 10k-mutation run.
+    vendored = "src/Implementations/C/cryptopt/fiat_{curve}_{method}.asm"
+
+    # Init artifact dir with assembly impls we will be linking.
+    staged_dir = out_dir / f"{curve}-{operation}"
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    # Build script expects these files to exist, but the benchmark never
+    # actually calls them. So we can just add stubs.
+    stubs = ["jasmin_aliases.s", "shake128.s"]
+    for name in stubs:
+        (staged_dir / name).write_text("")
+
+    # (staged-name suffix, source kind, scheduling strategy).  Kind "none" stages
+    # no assembly at all: with the leaves missing, build.sh fails and the crate
+    # silently falls back to its own Rust field arithmetic.
+    variants = [
+        ("rust", "none", None),
+        ("ref", "vendored", None),
+        ("defnoopt", "noopt", "default"),
+        ("pmnoopt", "noopt", "pressure-minimized"),
+        ("defopt", "opt", "default"),
+        ("pmopt", "opt", "pressure-minimized"),
+    ]
+    sources = {}
+    for tag, kind, strategy in variants:
+        if kind == "none":
+            sources.update({(tag, method): "(none)" for method in leaves})
+            continue
+        for method, symbol in leaves.items():
+            src = source_asm(
+                curve, vendored, kind, strategy, method, start_states, opt_dir, seed
+            )
+            staged = staged_dir / f"bls12_{method}_cryptopt_{tag}.asm"
+            staged.write_text(rename_leaf(src.read_text(), curve, method, symbol))
+            sources[tag, method] = src.name
+
+    links = [generated / n for n in stubs]
+    links += [generated / f"bls12_{m}_cryptopt.asm" for m in leaves]
+
+    rows = []
+    log(
+        f"{'variant':<10} {'fp mul':>9} {'vs blst':>9} {'vs ark':>9} "
+        f"{'miller':>10} {'vs blst':>9} "
+        f"{'pairing':>11} {'vs blst':>9} {'vs ark':>9}"
+    )
+    try:
+        for name in stubs:
+            relink(generated / name, staged_dir / name)
+        for tag, kind, _ in variants:
+            for method in leaves:
+                link = generated / f"bls12_{method}_cryptopt.asm"
+                if kind == "none":
+                    link.unlink(missing_ok=True)
+                else:
+                    relink(link, staged_dir / f"bls12_{method}_cryptopt_{tag}.asm")
+            m = cargo_bench(package, "bench_compare", parse_compare, cpu)
+            if (kind != "none") != linked_archive(package, archive):
+                fatal(f"{tag}: unexpected {archive}; the wrong leaves were linked")
+            # Same convention as the example: ours / theirs, below 1.00 is faster.
+            r = {
+                f"{op}_vs_{arm}": m[f"{op}_cyc"] / m[f"{op}_{arm}_cyc"]
+                for op in COMPARE_ROWS.values()
+                for arm in ("blst", "ark")
+                if f"{op}_{arm}_cyc" in m
+            }
+            log(
+                f"{tag:<10} {m['fp_mul_cyc']:>9.1f} {r['fp_mul_vs_blst']:>8.2f}x "
+                f"{r['fp_mul_vs_ark']:>8.2f}x "
+                f"{m['miller_cyc']:>10.0f} {r['miller_vs_blst']:>8.2f}x "
+                f"{m['pairing_cyc']:>11.0f} {r['pairing_vs_blst']:>8.2f}x "
+                f"{r['pairing_vs_ark']:>8.2f}x"
+            )
+            rows.append(
+                {
+                    "curve": curve,
+                    "variant": tag,
+                    "fp_mul_cyc": f"{m['fp_mul_cyc']:.1f}",
+                    "miller_cyc": f"{m['miller_cyc']:.0f}",
+                    "pairing_cyc": f"{m['pairing_cyc']:.0f}",
+                    "pairing_ns": f"{m['pairing_ns']:.0f}",
+                    "blst_fp_mul_cyc": f"{m['fp_mul_blst_cyc']:.1f}",
+                    "blst_miller_cyc": f"{m['miller_blst_cyc']:.0f}",
+                    "blst_pairing_cyc": f"{m['pairing_blst_cyc']:.0f}",
+                    "ark_fp_mul_cyc": f"{m['fp_mul_ark_cyc']:.1f}",
+                    "ark_pairing_cyc": f"{m['pairing_ark_cyc']:.0f}",
+                    "mul_asm": sources[tag, "mul"],
+                    "square_asm": sources[tag, "square"],
+                }
+            )
+    finally:
+        for link in links:
+            link.unlink(missing_ok=True)
+
+    return rows
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Benchmark AUCurves high-level primitives against each "
-                    "CryptOpt field-arithmetic backend."
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "start_states", help="./artifacts_start_states from gen_starting_states.py"
     )
-    parser.add_argument("start_states", help="./artifacts_start_states from gen_starting_states.py")
-    parser.add_argument("opt_comparison", help="./artifacts_optimization_comparison from bench.py")
-    parser.add_argument("-o", "--out-dir", default=str(SCRIPT_ROOT / "artifacts_aucurves"),
-                        help="where to write aucurves_bench.csv")
-    parser.add_argument("--seed", default=None, help="seed to select (default: autodetect)")
-    parser.add_argument("--curve", action="append", choices=sorted(TARGETS),
-                        help="restrict to one curve (repeatable; default: all)")
-    parser.add_argument("-r", "--repeat", type=int, default=3,
-                        help="benchmark runs per configuration, best is kept (default: 3)")
-    parser.add_argument("--cpu", type=int, default=None,
-                        help="pin the benchmark to this CPU with taskset")
+    parser.add_argument(
+        "opt_comparison", help="./artifacts_optimization_comparison from bench.py"
+    )
+    parser.add_argument(
+        "-o",
+        "--out-dir",
+        default=str(SCRIPT_ROOT / "artifacts_aucurves"),
+        help="where to write the staged leaves and aucurves_bench.csv",
+    )
+    parser.add_argument(
+        "--seed",
+        default=None,
+        help="seed to use when selecting states (default: autodetect)",
+    )
+    parser.add_argument(
+        "--cpu",
+        type=int,
+        default=None,
+        help="pin the benchmark to this CPU with taskset",
+    )
     return parser.parse_args()
 
 
@@ -303,60 +308,23 @@ def main() -> None:
             fatal(f"not a directory: {path}")
 
     seed = args.seed or detect_seed(start_states)
-    curves = args.curve or sorted(TARGETS)
     out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / "aucurves_bench.csv"
 
     log(f"AUCurves: {AUCURVES_ROOT}")
-    log(f"Seed: {seed}")
-    log(f"Curves: {', '.join(curves)}")
-    log(f"Repeats: {args.repeat}")
     log(f"Pinned to CPU: {args.cpu if args.cpu is not None else '(unpinned)'}")
     log(f"Output: {out_csv}")
     log("")
 
-    vendored = read_vendored(curves)
-    touched = [
-        AUCURVES_ROOT / TARGETS[c]["crate"] / "generated" / name
-        for c in curves
-        for name in (
-            [dest for dest, _ in TARGETS[c]["leaves"].values()] + list(TARGETS[c]["aux"])
-        )
-    ]
-    saved = snapshot(touched)
-
-    rows = []
     start = time.monotonic()
-    try:
-        for curve in curves:
-            operation = TARGETS[curve]["operation"]
-            baseline = None
-            for label, kind, strategy in BACKENDS:
-                used = install(curve, kind, strategy, vendored, start_states, opt_dir, seed)
-                ns = run_bench(curve, kind, args.cpu, args.repeat)
-                if kind == "ref":
-                    baseline = ns
-                log(f"{curve:<12} {operation:<11} {label:<24} {ns:12.1f} ns/op"
-                    f"   ({baseline / ns:.2f}x)")
-                rows.append({
-                    "curve": curve,
-                    "operation": operation,
-                    "backend": label,
-                    "ns_per_op": f"{ns:.1f}",
-                    "speedup_vs_ref": f"{baseline / ns:.3f}",
-                    "mul_asm": used["mul"],
-                    "square_asm": used["square"],
-                })
-            log("")
-    finally:
-        restore(saved)
+    rows = bench_bls_pairing(out_dir, start_states, opt_dir, seed, args.cpu)
 
     with out_csv.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
 
+    log("")
     log(f"Wrote {len(rows)} rows to {out_csv} in {time.monotonic() - start:.0f}s")
 
 

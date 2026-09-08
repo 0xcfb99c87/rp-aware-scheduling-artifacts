@@ -4,425 +4,361 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
-import platform
 import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-AUCURVES = ROOT / "AUCurves"
-BENCH_BIN = AUCURVES / "target" / "release" / "cryptopt-bench"
+SCRIPT_ROOT = Path(__file__).resolve().parent
+AUCURVES_ROOT = SCRIPT_ROOT / "AUCurves"
 
-# Columns cryptopt-bench prints, then the ones added here.
-BENCH_COLS = [
-    "curve",
-    "operation",
-    "asm_linked",
-    "iters",
-    "ns_per_op_min",
-    "ns_per_op_median",
-]
-CSV_HEADER = (
-    ["curve", "operation", "stage", "strategy", "mul_seed", "square_seed"]
-    + BENCH_COLS[2:]
-    + ["mul_asm", "square_asm", "verified", "host", "timestamp_utc"]
-)
+# The `_bls12_mul` / `_bls12_square` symbols are what AUCurves' build.sh links
+# in place of the Rust CIOS leaves in bls12-381-safe-rust/src/stubs.rs.  Its
+# jasmin_aliases.s exists only to bridge the CryptOpt symbol names to those two;
+# we rename the globals in the assembly directly instead, so the alias file is
+# assembled empty.
+JASMIN_ALIASES = """\t.text
+"""
 
-GLOBAL_RE = re.compile(r"^\s*GLOBAL\s+(\S+)\s*$", re.MULTILINE)
-
-
-def warn(msg):
-    print(f"bench_aucurves.py: {msg}", file=sys.stderr, flush=True)
-
-
-@dataclass
-class BenchmarkTarget:
-    # The curve to evaluate.
-    curve: str
-    # The crate in AUCurves of the respective curve to evaluate.
-    crate: str
-    # A prefix used to construct an env var, configuring the build to use our
-    # CryptOpt-generated code or the reference rust impl in AUCurves.
-    env_prefix: str
-    # Dict of method to Path of respective assembly file.
-    asm: dict
-    # Symbol to link.
-    sym: dict
-    # The test name to invoke in the AUCurves project: cargo test --test <name>
-    test: str
-
-
-@dataclass
-class Candidate:
-    curve: str
-    method: str
-    strategy: str
-    seed: str
-    stage: str
-    path: Path
-    rank: float
-
+# AUCurves' build.sh also assembles libjade's Jasmin SHAKE-128, which is not
+# shipped in the repository.  The pure-Rust path that the crate falls back on
+# when `cryptopt` is off is itself a stub returning zeros (src/shake128.rs), and
+# the caller pre-zeroes the output buffer, so this stub is equivalent.  No
+# benchmark here touches SHAKE-128.
+SHAKE128_STUB = """\t.text
+\t.globl jade_xof_shake128_amd64_ref
+jade_xof_shake128_amd64_ref:
+\txorl %eax, %eax
+\tret
+"""
 
 TARGETS = {
-    "p224": BenchmarkTarget(
-        "p224",
-        "p224-safe-rust",
-        "P224",
-        {"mul": "p224_mul_cryptopt.asm", "square": "p224_square_cryptopt.asm"},
-        {
-            "mul": ("fiat_p224_mul", "p224_cryptopt_mul"),
-            "square": ("fiat_p224_square", "p224_cryptopt_square"),
+    "bls12_381_p": {
+        "crate": "bls12-381-safe-rust",
+        "package": "bls12-381-safe-rust",
+        "operation": "pairing",
+        "archive": "libbls12_leaves.a",
+        # cryptopt method -> (destination under generated/, exported symbol)
+        "leaves": {
+            "mul": ("bls12_mul_cryptopt.asm", "_bls12_mul"),
+            "square": ("bls12_square_cryptopt.asm", "_bls12_square"),
         },
-        "cryptopt_diff",
-    ),
-    "p256": BenchmarkTarget(
-        "p256",
-        "p256-safe-rust",
-        "P256",
-        {"mul": "p256_mul_cryptopt.asm", "square": "p256_square_cryptopt.asm"},
-        {
-            "mul": ("fiat_p256_mul", "p256_cryptopt_mul"),
-            "square": ("fiat_p256_square", "p256_cryptopt_square"),
+        # The CryptOpt assembly AUCurves vendors itself.  This crate's
+        # generated/ ships none; these are the files the C pairing pipeline in
+        # src/Implementations/C/ links (see that directory's README.md).
+        "vendored": {
+            "mul": "src/Implementations/C/cryptopt/fiat_bls12_381_p_mul.asm",
+            "square": "src/Implementations/C/cryptopt/fiat_bls12_381_p_square.asm",
         },
-        "cryptopt_diff",
-    ),
-    "p384": BenchmarkTarget(
-        "p384",
-        "p384-safe-rust",
-        "P384",
-        {"mul": "p384_mul_cryptopt.asm", "square": "p384_square_cryptopt.asm"},
-        {
-            "mul": ("fiat_p384_mul", "p384_cryptopt_mul"),
-            "square": ("fiat_p384_square", "p384_cryptopt_square"),
+        "aux": {"jasmin_aliases.s": JASMIN_ALIASES, "shake128.s": SHAKE128_STUB},
+        "ref_env": {},
+        "metric": ("Pairing:", "us", 1000.0),
+    },
+    "p384": {
+        "crate": "p384-safe-rust",
+        "package": "p384-safe-rust",
+        "operation": "scalarmult",
+        "archive": "libp384_cryptopt.a",
+        "leaves": {
+            "mul": ("p384_mul_cryptopt.asm", "p384_cryptopt_mul"),
+            "square": ("p384_square_cryptopt.asm", "p384_cryptopt_square"),
         },
-        "cryptopt_diff",
-    ),
-    "bls12_381_p": BenchmarkTarget(
-        "bls12_381",
-        "bls12-381-safe-rust",
-        "BLS12_381",
-        {"mul": "bls12_mul_cryptopt.asm", "square": "bls12_square_cryptopt.asm"},
-        {
-            "mul": ("fiat_bls12_381_p_mul", "fiat_bls12_381_p_mul"),
-            "square": ("fiat_bls12_381_p_square", "fiat_bls12_381_p_square"),
+        # Here the vendored files are the crate's own generated/ inputs, already
+        # carrying the renamed symbol; they are read before the run overwrites
+        # them and put back verbatim for the aucurves-upstream measurement.
+        "vendored": {
+            "mul": "p384-safe-rust/generated/p384_mul_cryptopt.asm",
+            "square": "p384-safe-rust/generated/p384_square_cryptopt.asm",
         },
-        "kat_vectors",
-    ),
+        "ref_env": {"P384_NO_CRYPTOPT": "1"},
+        "aux": {},
+        "metric": ("g1_scalar_mul (384-bit)", "ns/op", 1.0),
+    },
 }
 
+# (csv label, kind, scheduling strategy)
+BACKENDS = [
+    ("aucurves-ref", "ref", None),
+    ("aucurves-upstream", "upstream", None),
+    ("aucurves+noopt+default", "noopt", "default"),
+    ("aucurves+noopt+pm", "noopt", "pressure-minimized"),
+    ("aucurves+opt+default", "opt", "default"),
+    ("aucurves+opt+pm", "opt", "pressure-minimized"),
+]
 
-def discover(roots):
-    by_sym = {s[0]: (c, m) for c, t in TARGETS.items() for m, s in t.sym.items()}
-    out, skipped = [], 0
-    for label, root in roots:
-        for asm in sorted(root.rglob("*.asm")):
-            m = GLOBAL_RE.search(asm.read_text(errors="replace")[:4096])
-            if not m or m.group(1) not in by_sym:
-                skipped += 1
-                continue
-            curve, method = by_sym[m.group(1)]
-            # Both layouts drop the state file beside the .asm, under the
-            # same name minus the _seed/_ratio suffixes CryptOpt appends.
-            js = asm.parent / (re.sub(r"(_seed\d+)?_ratio\d+$", "", asm.stem) + ".json")
-            if not js.exists():
-                warn(f"skipping {asm}: no state file at {js.name}")
-                continue
-            state = json.loads(js.read_text())
-            parsed = state.get("parsedArgs", {})
-            # `scheduling-algorithm` (kebab) is authoritative: CryptOpt leaves
-            # the camelCase key at its default in the state file an optimized
-            # run writes out, which would label every such run "default".
-            algo = parsed.get("scheduling-algorithm") or parsed.get(
-                "schedulingAlgorithm"
-            )
-            strategy = (
-                f"pressure-minimized-la{parsed.get('pmLookahead', 1)}"
-                if algo == "pressure-minimized"
-                else algo
-            )
-            # Rank candidates the way select_best_states.py does: by the
-            # CryptOpt-measured cycle count where there is one (starting
-            # states write `.cycles`), else by the ratio an optimized run
-            # records in its state file.  Lower is better either way.
-            cyc = js.with_suffix(".cycles")
-            rank = (
-                float(cyc.read_text().split()[0])
-                if cyc.exists()
-                else -float(state.get("ratio", 0))
-            )
-            # `bench.py` hands CryptOpt a --resultDir, which it lays out as
-            # <dir>/fiat/fiat_<curve>_<method>/; gen_starting_states.py writes
-            # flat.  That is what separates the two stages.
-            stage = label or (
-                "optimized" if asm.parent.parent.name == "fiat" else "start-state"
-            )
-            out.append(
-                Candidate(
-                    curve,
-                    method,
-                    strategy,
-                    str(parsed.get("seed", "?")),
-                    stage,
-                    asm,
-                    rank,
-                )
-            )
-    if skipped:
-        print(f"  ({skipped} leaves skipped: no AUCurves consumer for that target)")
+
+def fatal(msg: str) -> None:
+    print(f"bench_aucurves.py: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def detect_seed(start_states: Path) -> str:
+    seeds = sorted(
+        p.name[len("seed"):]
+        for p in start_states.iterdir()
+        if p.is_dir() and p.name.startswith("seed")
+    )
+    if not seeds:
+        fatal(f"no seed<N> directory under {start_states}")
+    if len(seeds) > 1:
+        fatal(f"{start_states} holds several seeds ({', '.join(seeds)}); pass --seed")
+    return seeds[0]
+
+
+def rename_leaf(body: str, curve: str, method: str, symbol: str) -> str:
+    """Point a CryptOpt .asm at the symbol the AUCurves crate links against.
+
+    Only the GLOBAL directive and the label are touched, so provenance comments
+    keep naming the fiat function.  A file already exporting `symbol` (AUCurves'
+    vendored p384 leaves) passes through unchanged.
+    """
+    fiat = re.escape(f"fiat_{curve}_{method}")
+    body = re.sub(rf"^(\s*GLOBAL\s+){fiat}\s*$", rf"\g<1>{symbol}", body, flags=re.M)
+    body = re.sub(rf"^{fiat}:", f"{symbol}:", body, flags=re.M)
+    if not re.search(rf"^\s*GLOBAL\s+{re.escape(symbol)}\s*$", body, flags=re.M):
+        fatal(f"no GLOBAL {symbol} after rewriting the {curve} {method} assembly")
+    return body
+
+
+def read_vendored(curves: list[str]) -> dict[tuple[str, str], tuple[str, str]]:
+    """(curve, method) -> (source filename, assembly ready to install).
+
+    Read up front, because installing an earlier backend overwrites the
+    destination, which for p384 is the vendored file itself.
+    """
+    out = {}
+    for curve in curves:
+        target = TARGETS[curve]
+        for method, (_, symbol) in target["leaves"].items():
+            src = AUCURVES_ROOT / target["vendored"][method]
+            if not src.is_file():
+                fatal(f"missing vendored assembly: {src}")
+            out[(curve, method)] = (src.name, rename_leaf(src.read_text(), curve, method, symbol))
     return out
 
 
-@dataclass
-class Variant:
-    curve: str
-    stage: str
-    strategy: str
-    leaves: dict  # method -> Cand, empty for the baselines
-    no_cryptopt: bool = False
-
-    @property
-    def target(self):
-        return TARGETS[self.curve]
-
-    def seed(self, method):
-        return self.leaves[method].seed if method in self.leaves else ""
-
-    def asm(self, method):
-        return str(self.leaves[method].path) if method in self.leaves else ""
-
-    def __str__(self):
-        seeds = "+".join(sorted({c.seed for c in self.leaves.values()}))
-        return f"{self.stage}--{self.strategy}" + (f"--seed{seeds}" if seeds else "")
+def source_asm(
+    curve: str, kind: str, strategy: str, method: str,
+    start_states: Path, opt_dir: Path, seed: str,
+) -> Path:
+    if kind == "noopt":
+        path = (
+            start_states / f"seed{seed}" / curve / method
+            / f"{curve}_{method}_{strategy}_seed{seed}_ratio0.asm"
+        )
+    else:
+        run_dir = opt_dir / f"{curve}--{method}--{strategy}--seed{seed}"
+        found = sorted((run_dir / "fiat" / f"fiat_{curve}_{method}").glob("*.asm"))
+        if len(found) != 1:
+            fatal(f"expected exactly one .asm under {run_dir}, found {len(found)}")
+        path = found[0]
+    if not path.is_file():
+        fatal(f"missing assembly: {path}")
+    return path
 
 
-def variants(cands, curves):
-    """Baselines, then one variant per (curve, stage, strategy).
+def install(curve: str, kind: str, strategy: str | None, vendored: dict, *args) -> dict[str, str]:
+    """Write the generated/ files for one backend; return the asm names used."""
+    target = TARGETS[curve]
+    gen = AUCURVES_ROOT / target["crate"] / "generated"
+    used = {}
 
-    Both leaves are linked together and a pairing or ladder exercises both,
-    so a variant needs a mul and a square.  Where they were searched under
-    different seeds --- which the shipped paper data does --- the best of
-    each is paired and both seeds are recorded.
-    """
-    out = []
-    for c in curves:
-        out.append(Variant(c, "baseline", "aucurves-upstream", {}))
-        out.append(Variant(c, "baseline", "reference", {}, no_cryptopt=True))
-
-    groups = {}
-    for cand in cands:
-        groups.setdefault((cand.curve, cand.stage, cand.strategy), []).append(cand)
-
-    for (curve, stage, strategy), cs in sorted(groups.items()):
-        best = {}
-        for cand in cs:
-            if cand.method not in best or cand.rank < best[cand.method].rank:
-                best[cand.method] = cand
-        if len(best) != 2:
-            warn(
-                f"{curve}/{stage}/{strategy}: only a {list(best)[0]} leaf; "
-                f"both are linked together, so this is not buildable"
-            )
+    for method, (dest, symbol) in target["leaves"].items():
+        if kind == "ref":
+            # No assembly: p384's build.rs is told to skip it via P384_NO_CRYPTOPT,
+            # and bls12-381's build.sh fails on the absent input and falls back to
+            # the Rust leaves, which is the state of a clean AUCurves checkout.
+            (gen / dest).unlink(missing_ok=True)
+            used[method] = "(none)"
             continue
-        out.append(Variant(curve, stage, strategy, best))
-    return out
+        if kind == "upstream":
+            name, body = vendored[(curve, method)]
+        else:
+            src = source_asm(curve, kind, strategy, method, *args)
+            name, body = src.name, rename_leaf(src.read_text(), curve, method, symbol)
+        (gen / dest).write_text(body)
+        used[method] = name
+
+    for name, body in target["aux"].items():
+        if kind == "ref":
+            (gen / name).unlink(missing_ok=True)
+        else:
+            (gen / name).write_text(body)
+
+    return used
 
 
-def install(variant):
-    """Put this variant's leaves in place, renaming the exported symbol.
-
-    AUCurves links the NIST leaves under a `<curve>_cryptopt_*` name so the
-    assembly cannot shadow the fiat-rust function it replaces; the BLS12-381
-    alias shim jumps to CryptOpt's own name, so that one is copied through
-    unchanged.  Nothing else is touched, so each file keeps its CryptOpt
-    metadata footer.
-    """
-    t = variant.target
-    for method, cand in variant.leaves.items():
-        src, dst = t.sym[method]
-        text = cand.path.read_text(errors="replace")
-        found = GLOBAL_RE.search(text)
-        if not found or found.group(1) != src:
-            raise ValueError(
-                f"{cand.path}: exports {found and found.group(1)!r}, expected {src!r}"
-            )
-        if dst != src:
-            text, n = re.subn(rf"\b{re.escape(src)}\b", dst, text)
-            if n < 2:  # the GLOBAL directive and the label
-                raise ValueError(f"{cand.path}: renamed {src!r} only {n} time(s)")
-        (AUCURVES / t.crate / "generated" / t.asm[method]).write_text(text)
+def parse_metric(out: str, label: str, unit: str) -> float | None:
+    for line in out.splitlines():
+        if not line.startswith(label):
+            continue
+        fields = line.split()
+        if unit not in fields:
+            continue
+        return float(fields[fields.index(unit) - 1])
+    return None
 
 
-# Run a process in the AUCurves project directory.
-def run(cmd, env, timeout=1800):
-    return subprocess.run(
-        cmd, cwd=AUCURVES, env=env, capture_output=True, text=True, timeout=timeout
+def run_bench(curve: str, kind: str, cpu: int | None, repeat: int) -> float:
+    target = TARGETS[curve]
+    manifest = AUCURVES_ROOT / target["crate"] / "Cargo.toml"
+    env = dict(os.environ)
+    env.pop("P384_NO_CRYPTOPT", None)
+    if kind == "ref":
+        env.update(target["ref_env"])
+
+    # Rebuild the crate from scratch so no stale build-script output or leaf
+    # archive from the previous backend can survive into this measurement.
+    subprocess.run(
+        ["cargo", "clean", "--release", "-p", target["package"]],
+        cwd=AUCURVES_ROOT, env=env, check=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
+    cmd = ["cargo", "run", "--release", "--quiet",
+           "--manifest-path", str(manifest), "--example", "bench"]
+    if cpu is not None:
+        cmd = ["taskset", "-c", str(cpu)] + cmd
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("roots", nargs="*", help="dirs to search for CryptOpt .asm")
-    p.add_argument(
-        "-o",
-        "--output",
-        default=str(ROOT / "artifacts_aucurves" / "aucurves_bench.csv"),
+    label, unit, scale = target["metric"]
+    best = None
+    for _ in range(repeat):
+        proc = subprocess.run(
+            cmd, cwd=AUCURVES_ROOT, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        if proc.returncode != 0:
+            fatal(f"{curve}/{kind}: bench failed:\n{proc.stderr}")
+        value = parse_metric(proc.stdout, label, unit)
+        if value is None:
+            fatal(f"{curve}/{kind}: no '{label}' line in bench output:\n{proc.stdout}")
+        best = value if best is None else min(best, value)
+
+    # Guard against silently reporting fiat-rust numbers as a CryptOpt backend:
+    # the leaf archive exists if and only if the assembly was linked.
+    archives = list(
+        (AUCURVES_ROOT / "target" / "release" / "build").glob(
+            f"{target['package']}-*/out/{target['archive']}"
+        )
     )
-    p.add_argument("--curves", default=",".join(TARGETS))
-    p.add_argument("--rounds", type=int, default=7)
-    p.add_argument("--round-ms", type=int, default=200)
-    p.add_argument("--cpu", default="0", help="CPU to pin to, or 'none'")
-    p.add_argument("--no-verify", action="store_true", help="skip the correctness test")
-    p.add_argument("--list", action="store_true")
-    args = p.parse_args()
+    if kind == "ref" and archives:
+        fatal(f"{curve}/ref: {target['archive']} was built; assembly leaked in")
+    if kind != "ref" and not archives:
+        fatal(f"{curve}/{kind}: {target['archive']} missing; assembly was not linked")
 
-    curves = [c.strip() for c in args.curves.split(",") if c.strip()]
-    for c in curves:
-        if c not in TARGETS:
-            sys.exit(f"unknown curve {c!r}; supported: {', '.join(TARGETS)}")
-    if shutil.which("nasm") is None:
-        sys.exit("nasm not found on PATH; the leaves cannot be assembled")
+    return best * scale
 
-    roots = []
-    for spec in args.roots:
-        label, _, path = spec.rpartition("=")
-        d = Path(path).resolve()
-        if not d.is_dir():
-            sys.exit(f"{d} is not a directory")
-        roots.append((label or None, d))
 
-    print("Discovering CryptOpt artifacts...")
-    cands = [c for c in discover(roots) if c.curve in curves]
-    vs = variants(cands, curves)
-    print(f"{len(vs)} variants\n")
-    for v in vs:
-        print(f"  {v.target.curve:10s} {v}")
-    if args.list:
-        return 0
-    print()
+def snapshot(paths: list[Path]) -> dict[Path, bytes | None]:
+    return {p: p.read_bytes() if p.is_file() else None for p in paths}
 
-    out_csv = Path(args.output).resolve()
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    # Back up every committed leaf we might overwrite, and restore on the way
-    # out however we leave -- a failed build or a Ctrl-C must not leave a
-    # candidate sitting in the AUCurves tree looking like the shipped one.
-    backup = out_csv.parent / "generated_backup"
-    for c in curves:
-        t = TARGETS[c]
-        (backup / t.crate).mkdir(parents=True, exist_ok=True)
-        for f in t.asm.values():
-            shutil.copy2(AUCURVES / t.crate / "generated" / f, backup / t.crate / f)
+def restore(snap: dict[Path, bytes | None]) -> None:
+    for path, body in snap.items():
+        if body is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(body)
 
-    rows, failures = [], 0
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Benchmark AUCurves high-level primitives against each "
+                    "CryptOpt field-arithmetic backend."
+    )
+    parser.add_argument("start_states", help="./artifacts_start_states from gen_starting_states.py")
+    parser.add_argument("opt_comparison", help="./artifacts_optimization_comparison from bench.py")
+    parser.add_argument("-o", "--out-dir", default=str(SCRIPT_ROOT / "artifacts_aucurves"),
+                        help="where to write aucurves_bench.csv")
+    parser.add_argument("--seed", default=None, help="seed to select (default: autodetect)")
+    parser.add_argument("--curve", action="append", choices=sorted(TARGETS),
+                        help="restrict to one curve (repeatable; default: all)")
+    parser.add_argument("-r", "--repeat", type=int, default=3,
+                        help="benchmark runs per configuration, best is kept (default: 3)")
+    parser.add_argument("--cpu", type=int, default=None,
+                        help="pin the benchmark to this CPU with taskset")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    for tool in ("cargo", "nasm", "as", "ar"):
+        if shutil.which(tool) is None:
+            fatal(f"{tool} not found on PATH")
+    if args.cpu is not None and shutil.which("taskset") is None:
+        fatal("taskset not found on PATH")
+
+    start_states = Path(args.start_states).resolve()
+    opt_dir = Path(args.opt_comparison).resolve()
+    for path in (start_states, opt_dir, AUCURVES_ROOT):
+        if not path.is_dir():
+            fatal(f"not a directory: {path}")
+
+    seed = args.seed or detect_seed(start_states)
+    curves = args.curve or sorted(TARGETS)
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = out_dir / "aucurves_bench.csv"
+
+    log(f"AUCurves: {AUCURVES_ROOT}")
+    log(f"Seed: {seed}")
+    log(f"Curves: {', '.join(curves)}")
+    log(f"Repeats: {args.repeat}")
+    log(f"Pinned to CPU: {args.cpu if args.cpu is not None else '(unpinned)'}")
+    log(f"Output: {out_csv}")
+    log("")
+
+    vendored = read_vendored(curves)
+    touched = [
+        AUCURVES_ROOT / TARGETS[c]["crate"] / "generated" / name
+        for c in curves
+        for name in (
+            [dest for dest, _ in TARGETS[c]["leaves"].values()] + list(TARGETS[c]["aux"])
+        )
+    ]
+    saved = snapshot(touched)
+
+    rows = []
+    start = time.monotonic()
     try:
-        for i, v in enumerate(vs, 1):
-            t = v.target
-            tag = f"[{i}/{len(vs)}] {t.curve} {v}"
-
-            # Every variant starts from the committed leaves, so a previous
-            # candidate cannot linger in a crate this one does not replace.
-            for c in curves:
-                for f in TARGETS[c].asm.values():
-                    shutil.copy2(
-                        backup / TARGETS[c].crate / f,
-                        AUCURVES / TARGETS[c].crate / "generated" / f,
-                    )
-            try:
-                install(v)
-            except ValueError as e:
-                warn(f"{tag}: {e}")
-                failures += 1
-                continue
-
-            env = dict(os.environ)
-            env.pop(f"{t.env_prefix}_NO_CRYPTOPT", None)
-            if v.no_cryptopt:
-                env[f"{t.env_prefix}_NO_CRYPTOPT"] = "1"
-
-            print(f"{tag}: building")
-            r = run(["cargo", "build", "--release", "-p", "cryptopt-bench"], env)
-            if r.returncode:
-                warn(f"{tag}: build failed:\n{r.stderr[-1500:]}")
-                failures += 1
-                continue
-
-            verified = "skipped"
-            if not args.no_verify:
-                print(f"{tag}: verifying ({t.test})")
-                r = run(
-                    ["cargo", "test", "--release", "-p", t.crate, "--test", t.test], env
-                )
-                if r.returncode:
-                    warn(
-                        f"{tag}: CORRECTNESS CHECK FAILED, not benchmarking:\n"
-                        f"{(r.stdout + r.stderr)[-1500:]}"
-                    )
-                    failures += 1
-                    continue
-                verified = t.test
-
-            print(f"{tag}: measuring")
-            # --require-asm unless we asked for the reference leaves: a
-            # silent fall back to fiat would otherwise look like a candidate
-            # that merely happens to match fiat's speed.
-            cmd = ([] if args.cpu == "none" else ["taskset", "-c", args.cpu]) + [
-                str(BENCH_BIN),
-                "--curve",
-                t.curve,
-                "--rounds",
-                str(args.rounds),
-                "--round-ms",
-                str(args.round_ms),
-            ]
-            if not v.no_cryptopt:
-                cmd.append("--require-asm")
-            r = run(cmd, env)
-            if r.returncode:
-                warn(f"{tag}: benchmark exited {r.returncode}:\n{r.stderr[-1500:]}")
-                failures += 1
-                continue
-
-            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            for line in r.stdout.splitlines():
-                rec = dict(zip(BENCH_COLS, line.split(",")))
-                rows.append(
-                    {
-                        "curve": rec["curve"],
-                        "operation": rec["operation"],
-                        "stage": v.stage,
-                        "strategy": v.strategy,
-                        "mul_seed": v.seed("mul"),
-                        "square_seed": v.seed("square"),
-                        **{k: rec[k] for k in BENCH_COLS[2:]},
-                        "mul_asm": v.asm("mul"),
-                        "square_asm": v.asm("square"),
-                        "verified": verified,
-                        "host": platform.node(),
-                        "timestamp_utc": now,
-                    }
-                )
+        for curve in curves:
+            operation = TARGETS[curve]["operation"]
+            baseline = None
+            for label, kind, strategy in BACKENDS:
+                used = install(curve, kind, strategy, vendored, start_states, opt_dir, seed)
+                ns = run_bench(curve, kind, args.cpu, args.repeat)
+                if kind == "ref":
+                    baseline = ns
+                log(f"{curve:<12} {operation:<11} {label:<24} {ns:12.1f} ns/op"
+                    f"   ({baseline / ns:.2f}x)")
+                rows.append({
+                    "curve": curve,
+                    "operation": operation,
+                    "backend": label,
+                    "ns_per_op": f"{ns:.1f}",
+                    "speedup_vs_ref": f"{baseline / ns:.3f}",
+                    "mul_asm": used["mul"],
+                    "square_asm": used["square"],
+                })
+            log("")
     finally:
-        for c in curves:
-            t = TARGETS[c]
-            for f in t.asm.values():
-                shutil.copy2(backup / t.crate / f, AUCURVES / t.crate / "generated" / f)
-        print("Restored the committed leaves in AUCurves.")
+        restore(saved)
 
-    with out_csv.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"\nWrote {len(rows)} rows to {out_csv}")
-    if failures:
-        warn(f"{failures} variant(s) failed; the CSV covers the rest")
-    return 1 if failures else 0
+    with out_csv.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    log(f"Wrote {len(rows)} rows to {out_csv} in {time.monotonic() - start:.0f}s")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -17,10 +17,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_TIMEOUT_SECONDS = 60 * 60 * 4  # four hours
-
 SCRIPT_ROOT = Path(__file__).resolve().parent
 CRYPTOPT_ROOT = SCRIPT_ROOT / "CryptOpt"
+DEFAULT_TIMEOUT_SECONDS = 60 * 60 * 4  # four hours
 
 print_lock = threading.Lock()
 
@@ -53,15 +52,11 @@ def now_str() -> str:
 
 
 def make_run_id(state: dict) -> str:
-    """Derive a result-dir name from a readState JSON's embedded parsedArgs,
-    so it stays unique per (curve, method, scheduling algorithm, seed)."""
     parsed = state.get("parsedArgs") or {}
     curve = parsed.get("curve", "unknown-curve")
     method = parsed.get("method", "unknown-method")
     seed = parsed.get("seed", "unknown-seed")
     algo = parsed.get("schedulingAlgorithm", "default")
-    if algo == "pressure-minimized":
-        algo = f"pressure-minimized-la{parsed.get('pmLookahead', '?')}"
     return f"{curve}--{method}--{algo}--seed{seed}"
 
 
@@ -182,8 +177,6 @@ def process_run(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return
 
-    # Process exited cleanly: atomically promote the temp dir to the final
-    # location. If it's taken (e.g. a duplicate trial), append _1, _2, ...
     final_dir = run["resultDir"]
     suffix = 1
     while True:
@@ -224,7 +217,7 @@ def worker(
             jobs.task_done()
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def parse_args():
     parser = argparse.ArgumentParser(
         description="Continue CryptOpt optimization from each starting-state JSON found under a directory, in parallel.",
         usage="%(prog)s [flags] [root]",
@@ -272,15 +265,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="enable debug output",
     )
-    return parser
+    return parser.parse_args()
 
 
 def main() -> None:
-    args = build_arg_parser().parse_args()
-
+    args = parse_args()
     base_dir = os.path.join(args.base_dir, "artifacts_optimization_comparison")
     os.makedirs(base_dir, exist_ok=True)
-
     runs = discover_runs(args.root, base_dir)
     if not runs:
         fatal(f"No readState JSON files found under {args.root}")
@@ -311,10 +302,9 @@ def main() -> None:
         jobs.put(run)
         time.sleep(0.1)
 
+    # Close the "channel", tells the workers to stop awaiting more requests.
     for _ in threads:
-        jobs.put(
-            None
-        )  # sentinel: tells each worker to stop, playing the role of close(jobs)
+        jobs.put(None)
 
     for t in threads:
         t.join()

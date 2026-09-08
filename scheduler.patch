@@ -110,10 +110,10 @@ index df0b9d7..bc76cde 100644
  }
  
 diff --git a/src/CryptOpt.ts b/src/CryptOpt.ts
-index 4e04b47..3875d4f 100644
+index 4e04b47..8397ca2 100644
 --- a/src/CryptOpt.ts
 +++ b/src/CryptOpt.ts
-@@ -74,6 +74,14 @@ else if (parsedArgsFromCli.readState) {
+@@ -74,6 +74,15 @@ else if (parsedArgsFromCli.readState) {
    if (stateFile.parsedArgs) {
      parsedArgs = stateFile.parsedArgs;
    }
@@ -124,10 +124,20 @@ index 4e04b47..3875d4f 100644
 +  parsedArgs.evals = parsedArgsFromCli.evals;
 +  parsedArgs.proof = parsedArgsFromCli.proof;
 +  // order is overwritten in Model.import from statefile json anyways, just force the scheduling algorithm to default here.
++  // Note that we restore this value prior to dumping state so that the correct 'seed scheduler' can be infered from the JSON file.
 +  parsedArgs.schedulingAlgorithm = "default";
  }
  
  const { single, bets, betRatio, curve, method, verbose } = parsedArgs;
+@@ -146,7 +155,7 @@ async function run(args: OptimizerArgs): Promise<RunResult> {
+   }
+ 
+   const [statefile] = generateResultFilename({ ...args, symbolname: optimizer.getSymbolname() });
+-  Model.persist(statefile, parsedArgs);
++  Model.persist(statefile, { ...parsedArgs, schedulingAlgorithm: parsedArgsFromCli.schedulingAlgorithm });
+   const { ratio, convergence } = Model.getState();
+   return { statefile, ratio, convergence };
+ }
 diff --git a/src/GenerateStartState.ts b/src/GenerateStartState.ts
 new file mode 100644
 index 0000000..0716e8c

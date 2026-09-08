@@ -97,9 +97,13 @@ python3 ./bench.py -j 3 -e 100k ./artifacts_start_states
 
 This will optimize each starting state for 100k additional mutations in
 parallel batches of 3 (following the same methodology as in the original
-CryptOpt paper). By default, this will take a long time (easily over 12
-wall-clock hours). You can speed up this process by (1) increasing the parallel
-batch size, (2) reducing the number of evaluations, or (3) disabling CryptOpt's
+CryptOpt paper). The optimization performance data used to generate the
+trajectory graphs is written to the `.dat` file in each artifact dir (e.g.,
+`./artifacts_optimization_comparison/bls12_381_p--mul--pressure-minimized--seed4604/fiat/fiat_bls12_381_p_mul/seed0000000000004604.dat`).
+
+Note that by default, this will take a long time (easily multiple wall-clock
+hours) . You can speed up this process by (1) increasing the parallel batch
+size, (2) reducing the number of evaluations, or (3) disabling CryptOpt's
 verified correctness checking by passing `--no-proof`. The command above
 reflects the configuration used to achieve the results in the paper.
 

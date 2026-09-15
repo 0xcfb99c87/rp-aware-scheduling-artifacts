@@ -29,10 +29,10 @@ index 2fe3fbf..c3baf93 100644
        format: "es",
 diff --git a/src/Assemble.ts b/src/Assemble.ts
 new file mode 100644
-index 0000000..ed6ce02
+index 0000000..05eab29
 --- /dev/null
 +++ b/src/Assemble.ts
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,54 @@
 +/**
 + * Copyright 2023 University of Adelaide
 + *
@@ -57,6 +57,7 @@ index 0000000..ed6ce02
 +import { readFileSync } from "fs";
 +import { tmpdir } from "os";
 +import { FiatBridge } from "./bridge/fiat-bridge";
++import { Paul } from "./paul";
 +
 +let args = parsedArgs;
 +if (!args.readState) {
@@ -79,6 +80,7 @@ index 0000000..ed6ce02
 +const symbolname = bridge.machinecode(sharedObjectFilename, args.method, args.curve);
 +const json = bridge.getCryptOptFunction(args.method, args.curve);
 +Model.import(parsedArgs.readState, json);
++Paul.seed = args.seed;
 +
 +const strip = (code: asm[]) => code.filter((line) => line && !line.startsWith(";") && line !== "\n");
 +const { code } = assemble(parsedArgs.resultDir);
@@ -86,31 +88,29 @@ index 0000000..ed6ce02
 +  strip(["SECTION .text", `\tGLOBAL ${symbolname}`, `${symbolname}:`].concat(code)).join("\n"),
 +);
 diff --git a/src/CountCycle.ts b/src/CountCycle.ts
-index df0b9d7..bc76cde 100644
+index df0b9d7..4984a21 100644
 --- a/src/CountCycle.ts
 +++ b/src/CountCycle.ts
-@@ -164,6 +164,9 @@ function createMS(
+@@ -164,6 +164,8 @@ function createMS(
        ...KNOWN_SYMBOLS[symbol],
        seed,
        memoryConstraints: "none",
 +      // Has no effect here, as we just read asm file directly; just added to satisfy type checker.
 +      schedulingAlgorithm: "default",
-+      pmLookahead: 1,
      }).measuresuite;
    }
  
-@@ -181,6 +184,9 @@ function createMS(
+@@ -181,6 +183,8 @@ function createMS(
      cFile: cFilename,
      seed,
      memoryConstraints: "none",
 +    // See comment above.
 +    schedulingAlgorithm: "default",
-+    pmLookahead: 1,
    }).measuresuite;
  }
  
 diff --git a/src/CryptOpt.ts b/src/CryptOpt.ts
-index 4e04b47..8397ca2 100644
+index 4e04b47..64b50d3 100644
 --- a/src/CryptOpt.ts
 +++ b/src/CryptOpt.ts
 @@ -74,6 +74,15 @@ else if (parsedArgsFromCli.readState) {
@@ -118,7 +118,7 @@ index 4e04b47..8397ca2 100644
      parsedArgs = stateFile.parsedArgs;
    }
 +  // restore some
-+  parsedArgs.single = true;
++  parsedArgs.single = parsedArgsFromCli.single;
 +  parsedArgs.readState = parsedArgsFromCli.readState;
 +  parsedArgs.resultDir = parsedArgsFromCli.resultDir;
 +  parsedArgs.evals = parsedArgsFromCli.evals;
@@ -140,10 +140,10 @@ index 4e04b47..8397ca2 100644
  }
 diff --git a/src/GenerateStartState.ts b/src/GenerateStartState.ts
 new file mode 100644
-index 0000000..0716e8c
+index 0000000..cc48ad2
 --- /dev/null
 +++ b/src/GenerateStartState.ts
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,36 @@
 +/**
 + * Copyright 2023 University of Adelaide
 + *
@@ -165,9 +165,10 @@ index 0000000..0716e8c
 +import { Model } from "@/model";
 +import { init } from "@/optimizer";
 +import { join } from "path";
-+import { sha1Hash } from "./paul";
++import { Paul, sha1Hash } from "./paul";
 +import { tmpdir } from "os";
 +
++Paul.seed = parsedArgs.seed;
 +const randomString = sha1Hash(Math.ceil(Date.now() * Math.random())).toString(36);
 +const cacheDir = tmpdir();
 +const libcheckfunctionDirectory = join(cacheDir, "CryptOpt.cache", randomString);
@@ -180,7 +181,7 @@ index 0000000..0716e8c
 +process.stdout.write(JSON.stringify(state, null, 2));
 +process.stdout.write("\n");
 diff --git a/src/helper/argParse.ts b/src/helper/argParse.ts
-index 0c455bc..8dc1e03 100644
+index 0c455bc..3e2d496 100644
 --- a/src/helper/argParse.ts
 +++ b/src/helper/argParse.ts
 @@ -30,7 +30,12 @@ import {
@@ -197,7 +198,7 @@ index 0c455bc..8dc1e03 100644
  
  const y = await yargs(process.argv.slice(2));
  
-@@ -137,6 +142,18 @@ export const parsedArgs = y
+@@ -137,6 +142,12 @@ export const parsedArgs = y
        "If this is set, CryptOpt will prefer spilling into vector registers as long as they are available, then start spilling into memory. Must specify --xmm switch, too. It will not try to optimize on it. (i.e. The first 16 values to be spilled will be spilled into XMMs, the rest into memory.)",
      boolean: true,
    })
@@ -206,12 +207,6 @@ index 0c455bc..8dc1e03 100644
 +    default: "default",
 +    describe: "Instruction scheduling algorithm to use when constructing initial model node order.",
 +    choices: SCHEDULING_ALGORITHM_OPTIONS,
-+  })
-+  .option("pmLookahead", {
-+    number: true,
-+    default: 1,
-+    min: 1,
-+    describe: "How many scheduling steps to look ahead, when performing pressure-minimizing scheduling.",
 +  })
    .option("readState", {
      string: true,
@@ -232,7 +227,7 @@ index df5fcdc..271b5ca 100644
    if (isNaN(a) || isNaN(b)) {
      throw new Error("only support number numbers");
 diff --git a/src/model/model.class.ts b/src/model/model.class.ts
-index 0755b10..5fb7589 100644
+index 0755b10..26386f7 100644
 --- a/src/model/model.class.ts
 +++ b/src/model/model.class.ts
 @@ -37,9 +37,9 @@ import {
@@ -272,21 +267,19 @@ index 0755b10..5fb7589 100644
      Paul.seed = seed;
      globals.convergence = convergence;
      if ("time" in parsed) {
-@@ -118,9 +128,13 @@ export class Model {
+@@ -118,9 +128,11 @@ export class Model {
    public static init({
      json,
      memoryConstraints,
 +    schedulingAlgorithm,
-+    pmLookahead,
    }: {
      json: CryptOpt.Function;
      memoryConstraints: MEMORY_CONSTRAINTS_OPTIONS_T;
 +    schedulingAlgorithm: SCHEDULING_ALGORITHM_OPTIONS_T;
-+    pmLookahead: number;
    }): void {
      Model._methodParameters = json.returns;
      Model._methodParameters = Model._methodParameters.concat(json.arguments);
-@@ -139,7 +153,18 @@ export class Model {
+@@ -139,7 +151,16 @@ export class Model {
      Model._nodes = json.body as CryptOpt.StringOperation[];
      Model._nodeLookupMap = nodeLookupMap(Model._nodes);
      Model._neededBy = createDependencyRelation(Model._nodes, Model._nodeLookupMap, memoryConstraints);
@@ -297,9 +290,7 @@ index 0755b10..5fb7589 100644
 +        Model._order = toposort(Model._nodes, Model._neededBy);
 +        break;
 +      case "pressure-minimized":
-+        Model._order = reorderPressureMinimizing(Model._nodes, Model._nodeLookupMap, Model._neededBy, {
-+          lookaheadFactor: pmLookahead,
-+        });
++        Model._order = reorderPressureMinimizing(Model._nodes, Model._nodeLookupMap, Model._neededBy);
 +        break;
 +    }
 +
@@ -307,7 +298,7 @@ index 0755b10..5fb7589 100644
      Logger.log(
        Model.nodesInTopologicalOrder
 diff --git a/src/model/model.helper.ts b/src/model/model.helper.ts
-index 9855964..837da15 100644
+index 9855964..8f126ff 100644
 --- a/src/model/model.helper.ts
 +++ b/src/model/model.helper.ts
 @@ -21,8 +21,13 @@ import {
@@ -324,7 +315,7 @@ index 9855964..837da15 100644
  import type { CryptOpt, MEMORY_CONSTRAINTS_OPTIONS_T, Nodes } from "@/types";
  
  /**
-@@ -299,3 +304,241 @@ function groupDepLimbs(
+@@ -299,3 +304,237 @@ function groupDepLimbs(
      }
    }
  }
@@ -336,9 +327,6 @@ index 9855964..837da15 100644
 +  nodeIndexOf: ReadonlyMap<string, number>,
 +  // Map of varname (e.g., "x1") => set of direct varnames (as such nodes) which require x1 as part of their computation.
 +  consumersOf: ReadonlyMap<string, ReadonlySet<string>>,
-+  options?: {
-+    lookaheadFactor?: number;
-+  },
 +): number[] {
 +  // Sanity checks, copied from original random toposorting algo.
 +  nodes.forEach(assertStringNames);
@@ -348,8 +336,7 @@ index 9855964..837da15 100644
 +  const numNodes = nodes.length;
 +  const toBeScheduled = new Set(nodes.keys());
 +
-+  const lookaheadFactor = options?.lookaheadFactor ?? 1;
-+  if (lookaheadFactor < 1) throw new Error(`invalid lookahead factor: ${lookaheadFactor}`);
++  const lookaheadFactor = 1;
 +
 +  // Memoize results from bestSchedulableCandidate, using partial schedule + depth as key.
 +  const cache = new Map<bigint, { nodeIdx: number; totalCost: number }>();
@@ -566,8 +553,21 @@ index 9855964..837da15 100644
 +  }
 +  return true;
 +}
+diff --git a/src/optimizer/optimizer.class.ts b/src/optimizer/optimizer.class.ts
+index 857463e..e370517 100644
+--- a/src/optimizer/optimizer.class.ts
++++ b/src/optimizer/optimizer.class.ts
+@@ -75,6 +75,8 @@ export class Optimizer {
+     // load a saved state if necessary
+     if (args.readState) {
+       Model.import(args.readState);
++      // Ensure that optimizer seed arg has priority over readState's seed arg, as this value is explicitly overwritten, e.g., during bet phase.
++      Paul.seed = args.seed;
+     }
+     RegisterAllocator.options = args;
+   }
 diff --git a/src/optimizer/optimizer.helper.class.ts b/src/optimizer/optimizer.helper.class.ts
-index 1843b54..f474a67 100644
+index 1843b54..0474744 100644
 --- a/src/optimizer/optimizer.helper.class.ts
 +++ b/src/optimizer/optimizer.helper.class.ts
 @@ -25,7 +25,10 @@ import { ManualBridge } from "@/bridge/manual-bridge";
@@ -577,44 +577,40 @@ index 1843b54..f474a67 100644
 -type needComms = Pick<OptimizerArgs, "bridge" | "seed" | "memoryConstraints">;
 +type needComms = Pick<
 +  OptimizerArgs,
-+  "bridge" | "seed" | "memoryConstraints" | "schedulingAlgorithm" | "pmLookahead"
++  "bridge" | "seed" | "memoryConstraints" | "schedulingAlgorithm"
 +>;
  interface needJasmin extends needComms {
    bridge: "jasmin";
  }
-@@ -60,6 +63,8 @@ function initFiat(sharedObjectFilename: string, args: needFiat): ret {
+@@ -60,6 +63,7 @@ function initFiat(sharedObjectFilename: string, args: needFiat): ret {
    Model.init({
      memoryConstraints: args.memoryConstraints,
      json: bridge.getCryptOptFunction(args.method, args.curve),
 +    schedulingAlgorithm: args.schedulingAlgorithm,
-+    pmLookahead: args.pmLookahead,
    });
  
    const symbolname = bridge.machinecode(sharedObjectFilename, args.method, args.curve);
-@@ -77,6 +82,8 @@ function initBitcoinCore(sharedObjectFilename: string, args: needBitcoinCore): r
+@@ -77,6 +81,7 @@ function initBitcoinCore(sharedObjectFilename: string, args: needBitcoinCore): r
    Model.init({
      memoryConstraints: args.memoryConstraints,
      json: bridge.getCryptOptFunction(args.method),
 +    schedulingAlgorithm: args.schedulingAlgorithm,
-+    pmLookahead: args.pmLookahead,
    });
  
    const symbolname = bridge.machinecode(sharedObjectFilename, args.method);
-@@ -95,6 +102,8 @@ function initJasmin(sharedObjectFilename: string, args: needJasmin): ret {
+@@ -95,6 +100,7 @@ function initJasmin(sharedObjectFilename: string, args: needJasmin): ret {
    Model.init({
      memoryConstraints: args.memoryConstraints,
      json: bridge.getCryptOptFunction(),
 +    schedulingAlgorithm: args.schedulingAlgorithm,
-+    pmLookahead: args.pmLookahead,
    });
  
    const symbolname = bridge.machinecode(sharedObjectFilename);
-@@ -118,6 +127,8 @@ function initManual(sharedObjectFilename: string, args: needManual): ret {
+@@ -118,6 +124,7 @@ function initManual(sharedObjectFilename: string, args: needManual): ret {
    Model.init({
      memoryConstraints: args.memoryConstraints,
      json: bridge.getCryptOptFunction(),
 +    schedulingAlgorithm: args.schedulingAlgorithm,
-+    pmLookahead: args.pmLookahead,
    });
    const symbolname = bridge.machinecode(sharedObjectFilename);
    const chunksize = 16; // only for reading the chunk breaks atm. see MS code
@@ -633,7 +629,7 @@ index aabb8ae..73fbcc6 100644
  export namespace CryptOpt {
    export type StateFile = {
 diff --git a/src/types/optimizer.types.ts b/src/types/optimizer.types.ts
-index eebd586..6b5026c 100644
+index eebd586..30fb937 100644
 --- a/src/types/optimizer.types.ts
 +++ b/src/types/optimizer.types.ts
 @@ -17,7 +17,11 @@
@@ -649,337 +645,47 @@ index eebd586..6b5026c 100644
  
  export type OptimizerArgs = {
    evals: number;
-@@ -37,6 +41,8 @@ export type OptimizerArgs = {
+@@ -37,6 +41,7 @@ export type OptimizerArgs = {
    redzone: boolean;
    preferXmm?: boolean;
    framePointer: FRAME_POINTER_OPTIONS_T;
 +  schedulingAlgorithm: SCHEDULING_ALGORITHM_OPTIONS_T;
-+  pmLookahead: number;
    memoryConstraints: MEMORY_CONSTRAINTS_OPTIONS_T;
  };
  export type ParsedArgsT = OptimizerArgs & {
 diff --git a/test/RegisterAllocator.class.ts b/test/RegisterAllocator.class.ts
-index e720aed..a1c89a0 100644
+index e720aed..0a4be8a 100644
 --- a/test/RegisterAllocator.class.ts
 +++ b/test/RegisterAllocator.class.ts
-@@ -161,7 +161,9 @@ describe("RegisterAllocator:", () => {
+@@ -161,6 +161,7 @@ describe("RegisterAllocator:", () => {
          },
        ] as CryptOpt.StringOperation[],
      },
 +    schedulingAlgorithm: "default",
      memoryConstraints: "none",
-+    pmLookahead: 1,
    });
    const ra = RegisterAllocator.getInstance();
-   expect(ra).toBeTruthy();
 diff --git a/test/model.class.ts b/test/model.class.ts
-index bab2466..adecae0 100644
+index bab2466..4d352fd 100644
 --- a/test/model.class.ts
 +++ b/test/model.class.ts
-@@ -25,6 +25,8 @@ describe("Model.class", () => {
+@@ -25,6 +25,7 @@ describe("Model.class", () => {
    const body = createModelHelpers().nodes;
    Model.init({
      memoryConstraints: "none",
 +    schedulingAlgorithm: "default",
-+    pmLookahead: 1,
      json: {
        operation: "mul",
        arguments: [
-diff --git a/test/model.helper.pressureMinimizing.ts b/test/model.helper.pressureMinimizing.ts
-new file mode 100644
-index 0000000..b857d91
---- /dev/null
-+++ b/test/model.helper.pressureMinimizing.ts
-@@ -0,0 +1,279 @@
-+/**
-+ * Copyright 2023 University of Adelaide
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *    http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+import { describe, expect, it } from "vitest";
-+
-+import {
-+  bornSet,
-+  freedSet,
-+  getAllSchedulable,
-+  isNodeFinalConsumerOf,
-+  nodeLookupMap,
-+  createDependencyRelation,
-+  computeSchedulingCost,
-+  reorderPressureMinimizing,
-+} from "@/model";
-+import type { CryptOpt } from "@/types";
-+
-+function makeExampleDfg(): CryptOpt.StringOperation[] {
-+  const n = (name: string[], operation: string, args: string[], datatype: string = "u64") =>
-+    ({
-+      datatype,
-+      operation,
-+      name,
-+      arguments: args,
-+      decisions: {},
-+      decisionsHot: [],
-+    }) as unknown as CryptOpt.StringOperation;
-+  return [
-+    n(["x1"], "=", ["arg1[0]"]),
-+    n(["x2"], "=", ["arg1[1]"]),
-+    n(["x3"], "*", ["x1", "x2"], "u128"),
-+    n(["x5"], "+", ["x3_0", "x3_1"]),
-+    n(["x6"], "+", ["x5", "x5"]),
-+    n(["x30"], "+", ["arg1[1]", "x6"]),
-+    n(["out1[1]"], "=", ["x1"]),
-+    n(["out1[0]"], "=", ["x2"]),
-+  ];
-+}
-+
-+describe("computeBornCount / computeFreedCount", () => {
-+  const nodes = makeExampleDfg();
-+  const map = nodeLookupMap(nodes);
-+  const consumersOf = createDependencyRelation(nodes, map);
-+  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
-+  const scheduled = new Array<number>();
-+  describe("with nothing scheduled yet", () => {
-+    it.each([
-+      ["x1", 1, 0],
-+      ["x2", 1, 0],
-+      ["x3", 2, 0],
-+      ["x5", 1, 2],
-+      ["x6", 1, 1],
-+      ["x30", 0, 1],
-+      ["out1[1]", 0, 0],
-+      ["out1[0]", 0, 0],
-+    ] as const)("%s: born=%i, freed=%i", (name, expectedBorn, expectedFreed) => {
-+      const idx = indexOf(name);
-+      expect(bornSet(nodes[idx], consumersOf).size).toBe(expectedBorn);
-+      expect(freedSet(nodes[idx], nodes, map, consumersOf, scheduled).size).toBe(expectedFreed);
-+    });
-+  });
-+});
-+
-+describe("isNodeFinalConsumerOf", () => {
-+  const nodes = makeExampleDfg();
-+  const nodeIndexOf = nodeLookupMap(nodes);
-+  const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
-+
-+  it("returns false when another (unscheduled) consumer of the arg is still pending", () => {
-+    // x1 is consumed by x3 (both limbs) and by out1[1]; with nothing scheduled yet,
-+    // out1[1] is still pending, so x3 is not (yet) the final consumer of x1.
-+    const x3 = nodes[indexOf("x3")];
-+    expect(isNodeFinalConsumerOf(x3, "x1", nodeIndexOf, consumersOf, [])).toBe(false);
-+  });
-+
-+  it("returns true once every other consumer of the arg has been scheduled", () => {
-+    // Once out1[1] (the only other consumer of x1) has been scheduled, x3 becomes
-+    // the final consumer of x1.
-+    const x3 = nodes[indexOf("x3")];
-+    const out1_1Idx = indexOf("out1[1]");
-+    expect(isNodeFinalConsumerOf(x3, "x1", nodeIndexOf, consumersOf, [out1_1Idx])).toBe(true);
-+  });
-+
-+  it("returns true when the node is the sole consumer of the arg", () => {
-+    // x5 is the only consumer of x3_0, so it's trivially the final consumer, regardless
-+    // of what's been scheduled.
-+    const x5 = nodes[indexOf("x5")];
-+    expect(isNodeFinalConsumerOf(x5, "x3_0", nodeIndexOf, consumersOf, [])).toBe(true);
-+  });
-+
-+  it("throws when the given arg has no consumers", () => {
-+    // x30 is a dead write: nothing reads it, so it never appears as a key in consumersOf.
-+    const x30 = nodes[indexOf("x30")];
-+    expect(() => isNodeFinalConsumerOf(x30, "x30", nodeIndexOf, consumersOf, [])).toThrow();
-+  });
-+
-+  it("throws when the node itself cannot be found in nodeIndexOf", () => {
-+    const bogusNode = {
-+      ...nodes[indexOf("x3")],
-+      name: ["does-not-exist"],
-+    } as unknown as CryptOpt.StringOperation;
-+    expect(() => isNodeFinalConsumerOf(bogusNode, "x1", nodeIndexOf, consumersOf, [])).toThrow();
-+  });
-+});
-+
-+describe("getAllSchedulable", () => {
-+  const nodes = makeExampleDfg();
-+  const nodeIndexOf = nodeLookupMap(nodes);
-+  const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
-+
-+  it("only offers up the nodes with no unscheduled dependencies, from the start", () => {
-+    // x1 and x2 read directly from arg1, so they're immediately schedulable; everything
-+    // else transitively depends on one of them.
-+    const toBeScheduled = new Set(nodes.keys());
-+    const schedulable = getAllSchedulable(toBeScheduled, nodes, consumersOf).sort();
-+    expect(schedulable).toEqual([indexOf("x1"), indexOf("x2")].sort());
-+  });
-+
-+  it("unlocks the direct consumers of a node once it's no longer pending", () => {
-+    // Once x1 and x2 are scheduled (i.e., removed from toBeScheduled), x3 (which needs both)
-+    // and out1[1]/out1[0] (which each need just one of them) all become schedulable; x5
-+    // stays blocked since it still needs x3.
-+    const toBeScheduled = new Set(nodes.keys());
-+    toBeScheduled.delete(indexOf("x1"));
-+    toBeScheduled.delete(indexOf("x2"));
-+    const schedulable = getAllSchedulable(toBeScheduled, nodes, consumersOf).sort();
-+    expect(schedulable).toEqual([indexOf("x3"), indexOf("out1[1]"), indexOf("out1[0]")].sort());
-+  });
-+
-+  it("only offers up x5 (not x6) when both are still pending, since x6 needs x5", () => {
-+    const toBeScheduled = new Set([indexOf("x5"), indexOf("x6")]);
-+    expect(getAllSchedulable(toBeScheduled, nodes, consumersOf)).toEqual([indexOf("x5")]);
-+  });
-+
-+  it("returns an empty list when there's nothing left to schedule", () => {
-+    expect(getAllSchedulable(new Set(), nodes, consumersOf)).toEqual([]);
-+  });
-+});
-+
-+describe("computeSchedulingCost", () => {
-+  const nodes = makeExampleDfg();
-+  const nodeIndexOf = nodeLookupMap(nodes);
-+  const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+  const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
-+
-+  it.each([
-+    ["x1", 1],
-+    ["x2", 1],
-+    ["x3", 2],
-+    ["x5", -1],
-+    ["x6", 0],
-+    ["x30", -1],
-+  ] as const)("%s: born - freed = %i", (name, expectedCost) => {
-+    const idx = indexOf(name);
-+    expect(computeSchedulingCost(nodes[idx], nodes, nodeIndexOf, consumersOf, [])).toBe(expectedCost);
-+  });
-+});
-+
-+function assertValidTopologicalOrder(
-+  order: number[],
-+  nodes: ReadonlyArray<CryptOpt.StringOperation>,
-+  nodeIndexOf: ReadonlyMap<string, number>,
-+) {
-+  expect(order.length).toBe(nodes.length);
-+  expect(new Set(order).size).toBe(nodes.length);
-+
-+  const positionOf = new Map(order.map((nodeIdx, position) => [nodeIdx, position]));
-+  nodes.forEach((node, nodeIdx) => {
-+    node.arguments.forEach((arg) => {
-+      const producerIdx = nodeIndexOf.get(arg);
-+      if (producerIdx === undefined || producerIdx === nodeIdx) return;
-+      expect(positionOf.get(producerIdx)!).toBeLessThan(positionOf.get(nodeIdx)!);
-+    });
-+  });
-+}
-+
-+describe("reorderPressureMinimizing", () => {
-+  it.each([1, 2, 3, 4])("produces a valid topological order at lookaheadFactor: %i", (lookaheadFactor) => {
-+    const nodes = makeExampleDfg();
-+    const nodeIndexOf = nodeLookupMap(nodes);
-+    const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+
-+    const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor });
-+    assertValidTopologicalOrder(order, nodes, nodeIndexOf);
-+  });
-+
-+  it("doesn't throw when lookaheadFactor exceeds the number of nodes", () => {
-+    const nodes = makeExampleDfg();
-+    const nodeIndexOf = nodeLookupMap(nodes);
-+    const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+
-+    const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, {
-+      lookaheadFactor: nodes.length + 10,
-+    });
-+    assertValidTopologicalOrder(order, nodes, nodeIndexOf);
-+  });
-+
-+  it("rejects a lookaheadFactor below 1", () => {
-+    const nodes = makeExampleDfg();
-+    const nodeIndexOf = nodeLookupMap(nodes);
-+    const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+
-+    expect(() =>
-+      reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor: 0 }),
-+    ).toThrow();
-+  });
-+
-+  it("throws when the dependency graph is malformed (nothing schedulable but nodes remain)", () => {
-+    const n = (name: string[], operation: string, args: string[], datatype = "u64") =>
-+      ({
-+        datatype,
-+        operation,
-+        name,
-+        arguments: args,
-+        decisions: {},
-+        decisionsHot: [],
-+      }) as unknown as CryptOpt.StringOperation;
-+    const cyclicNodes = [n(["x1"], "+", ["x2", "x2"]), n(["x2"], "+", ["x1", "x1"])];
-+    const nodeIndexOf = nodeLookupMap(cyclicNodes);
-+    const consumersOf = createDependencyRelation(cyclicNodes, nodeIndexOf);
-+    expect(() => reorderPressureMinimizing(cyclicNodes, nodeIndexOf, consumersOf)).toThrow();
-+  });
-+
-+  describe("lookahead changes the chosen order", () => {
-+    function makeLookaheadDfg(): CryptOpt.StringOperation[] {
-+      const n = (name: string[], operation: string, args: string[], datatype = "u64") =>
-+        ({
-+          datatype,
-+          operation,
-+          name,
-+          arguments: args,
-+          decisions: {},
-+          decisionsHot: [],
-+        }) as unknown as CryptOpt.StringOperation;
-+      return [
-+        n(["x11"], "+", ["arg1[2]", "arg1[3]"]),
-+        n(["x12"], "+", ["arg1[0]", "arg1[1]"]),
-+        n(["x13"], "+", ["x12", "arg1[4]"]),
-+        n(["x14"], "+", ["x11", "arg1[5]"]),
-+        n(["x15"], "+", ["x14", "x14"]),
-+      ];
-+    }
-+
-+    it("picks x11 first at lookaheadFactor: 1", () => {
-+      const nodes = makeLookaheadDfg();
-+      const nodeIndexOf = nodeLookupMap(nodes);
-+      const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+      const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
-+
-+      const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor: 1 });
-+      expect(order[0]).toBe(indexOf("x11"));
-+    });
-+
-+    it("picks x12 first at lookaheadFactor: 2, since it leads to a better second step", () => {
-+      const nodes = makeLookaheadDfg();
-+      const nodeIndexOf = nodeLookupMap(nodes);
-+      const consumersOf = createDependencyRelation(nodes, nodeIndexOf);
-+      const indexOf = (name: string) => nodes.findIndex((node) => node.name[0] === name);
-+
-+      const order = reorderPressureMinimizing(nodes, nodeIndexOf, consumersOf, { lookaheadFactor: 2 });
-+      expect(order[0]).toBe(indexOf("x12"));
-+    });
-+  });
-+});
 diff --git a/test/test-helpers.ts b/test/test-helpers.ts
-index e711d5d..5de814a 100644
+index e711d5d..ceac711 100644
 --- a/test/test-helpers.ts
 +++ b/test/test-helpers.ts
-@@ -52,6 +52,8 @@ export function getTestArgs(filename: string): OptimizerArgs {
+@@ -52,6 +52,7 @@ export function getTestArgs(filename: string): OptimizerArgs {
      redzone: true,
      framePointer: "omit",
      memoryConstraints: "none",
 +    schedulingAlgorithm: "default",
-+    pmLookahead: 1,
    };
  }
  

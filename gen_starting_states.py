@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -227,7 +226,7 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     csv_out = Path(args.csv_out) if args.csv_out else out_dir / f"seed{seed}.csv"
     csv_out.parent.mkdir(parents=True, exist_ok=True)
-    runs: list[str] = ["default", "pressure-minimized"]
+    runs: list[str] = ["default", "pressure-minimized", "pressure-minimized-random"]
 
     total = len(curves) * len(methods) * len(runs)
     i = 0

@@ -74,9 +74,11 @@ def discover_runs(root: str, base_dir: str) -> list[dict]:
                 file=sys.stderr,
             )
             continue
+        readState = str(path.absolute())
         runs.append(
             {
-                "readState": str(path.absolute()),
+                "single": "pressure" in readState,
+                "readState": readState,
                 "resultDir": os.path.abspath(
                     os.path.join(base_dir, make_run_id(state))
                 ),
@@ -85,8 +87,10 @@ def discover_runs(root: str, base_dir: str) -> list[dict]:
     return runs
 
 
-def cli_args(run: dict, proof: bool, evals: str | None) -> list[str]:
-    args = ["--single", "--readState", run["readState"]]
+def cli_args(run: dict, proof: bool, single: bool, evals: str | None) -> list[str]:
+    args = ["--readState", run["readState"]]
+    if single:
+        args += ["--single"]
     if evals:
         args += ["--evals", evals]
     if not proof:
@@ -131,13 +135,14 @@ def process_run(
 
     tmp_run = dict(run)
     tmp_run["resultDir"] = tmp_dir
+    single = bool(run.get("single", False))
 
     cmd = [
         "taskset",
         "-c",
         str(cpu_id),
         (CRYPTOPT_ROOT / "CryptOpt").as_posix(),
-        *cli_args(tmp_run, opts.proof, opts.evals),
+        *cli_args(tmp_run, opts.proof, single, opts.evals),
     ]
 
     env = {}
@@ -308,6 +313,14 @@ def main() -> None:
 
     for t in threads:
         t.join()
+
+    # We only care about the final generated states; If --single is not
+    # enabled, CryptOpt outputs intermediate states for all bet-runs.
+    for bet in filter(
+        lambda p: os.path.isfile(p) and "0000000000" not in p.as_posix(),
+        Path(base_dir).rglob("seed*"),
+    ):
+        os.remove(bet)
 
     print("All runs completed.")
 

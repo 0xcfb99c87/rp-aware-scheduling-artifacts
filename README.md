@@ -82,17 +82,29 @@ seed or explore additional configurations by passing `--help` to the script
 targets).
 
 A summarized collection of statistics relating to these starting states will be
-written to `./artifacts_start_state/seed<seed>.csv`.
+written to `./artifacts_start_state/seed<seed>.csv`. You can run the script
+multiple times in order to obtain additional trials.
 
 ## Comparing Optimization Trajectory (§5.3)
 
-The script `./bench.py` allows for taking the starting states generated in the
-previous step and optimizing them further with CryptOpt, in order to compare
-the impact of each scheduler on optimization trajectory. Assuming that your
-starting states live in `./artifacts_start_states` you can run:
+The script `./bench.py` takes a collection of starting states (e.g., those
+generated in the previous step) and optimizes them further with CryptOpt. We
+use this to compare the impact of each scheduler on CryptOpt's subsequent
+optimization trajectory.
+
+If you have generated multiple starting states per curve, we provide an
+additional helper script `./extract_best_states.py` which automatically scans a
+starting state artifact dir and copies the best states to a fresh output
+directory.
+
+Assuming that your starting states live in `./artifacts_start_states` you can
+run to reproduce our experiment:
 
 ```bash
-python3 ./bench.py -j 3 -e 100k ./artifacts_start_states
+# Filter out best starting states for each combination of curve, method, and scheduler type.
+python3 ./extract_best_states.py -i ./artifacts_start_states -o ./artifacts_best_states
+# Optimize champion starting states for an additional 100k mutations.
+python3 ./bench.py -j 3 -e 100k ./artifacts_best_states
 ```
 
 This will optimize each starting state for 100k additional mutations in
@@ -102,7 +114,7 @@ trajectory graphs is written to the `.dat` file in each artifact dir (e.g.,
 `./artifacts_optimization_comparison/bls12_381_p--mul--pressure-minimized--seed4604/fiat/fiat_bls12_381_p_mul/seed0000000000004604.dat`).
 
 Note that by default, this will take a long time (easily multiple wall-clock
-hours) . You can speed up this process by (1) increasing the parallel batch
+hours). You can speed up this process by (1) increasing the parallel batch
 size, (2) reducing the number of evaluations, or (3) disabling CryptOpt's
 verified correctness checking by passing `--no-proof`. The command above
 reflects the configuration used to achieve the results in the paper.

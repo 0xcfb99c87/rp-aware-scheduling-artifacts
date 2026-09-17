@@ -238,7 +238,7 @@ def parse_args():
         "--jobs",
         dest="num_workers",
         type=int,
-        default=(os.cpu_count() or 2) // 2,
+        default=3,
         help="number of parallel jobs (CPUs to use)",
     )
     parser.add_argument(

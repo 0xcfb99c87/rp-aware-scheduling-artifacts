@@ -29,13 +29,21 @@ gcloud compute instances create benchmark \
 Then, install all required dependencies and enable non-root access to PMCs:
 
 ```bash
-sudo apt-get install autoconf build-essential \
+sudo apt-get update && sudo apt-get upgrade -y
+sudo apt-get install -y autoconf build-essential \
     clang libtool pkg-config nasm git linux-perf
-# AUCUrves requires Rust toolchain. Install via
-# rustup cause Debian's version is too old.
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y; . $HOME/.cargo/env
 echo "1" | sudo tee /proc/sys/kernel/perf_event_paranoid
+# Reduce background noise
+sudo systemctl stop \
+    cron \
+    google-guest-agent-manager \
+    google-guest-compat-manager \
+    google-osconfig-agent \
+    polkit \
+    rsyslog \
+    systemd-timesyncd \
+    systemd-udevd \
+    unattended-upgrades
 ```
 
 Note that this setting is not persistent across restarts; if you reboot your
@@ -46,9 +54,8 @@ Next, install [AssemblyLine](https://github.com/0xADE1A1DE/AssemblyLine) (a
 required dependency of CryptOpt):
 
 ```bash
-cd $HOME
-git clone https://github.com/0xADE1A1DE/AssemblyLine
-cd AssemblyLine
+git clone https://github.com/0xADE1A1DE/AssemblyLine ~/AssemblyLine
+cd ~/AssemblyLine
 ./autogen.sh
 ./configure --prefix=/usr
 make
@@ -60,9 +67,10 @@ Finally, clone this repository and run the setup script. This will build
 CryptOpt with our scheduler patches applied:
 
 ```bash
-cd $HOME
-git clone --recurse-submodules https://github.com/0xcfb99c87/rp-aware-scheduling-artifacts
-cd rp-aware-scheduling-artifacts
+git clone --recurse-submodules \
+    https://github.com/0xcfb99c87/rp-aware-scheduling-artifacts \
+    ~/rp-aware-scheduling-artifacts
+cd ~/rp-aware-scheduling-artifacts
 ./setup.sh
 ```
 
@@ -93,12 +101,12 @@ use this to compare the impact of each scheduler on CryptOpt's subsequent
 optimization trajectory.
 
 If you have generated multiple starting states per curve, we provide an
-additional helper script `./extract_best_states.py` which automatically scans a
-starting state artifact dir and copies the best states to a fresh output
-directory.
+additional helper script found at `./extract_best_states.py`, which
+automatically scans a starting state artifact dir and copies the best states to
+a fresh output directory.
 
 Assuming that your starting states live in `./artifacts_start_states` you can
-run to reproduce our experiment:
+run the following set of commands to reproduce our experiment:
 
 ```bash
 # Filter out best starting states for each combination of curve, method, and scheduler type.
@@ -113,53 +121,9 @@ CryptOpt paper). The optimization performance data used to generate the
 trajectory graphs is written to the `.dat` file in each artifact dir (e.g.,
 `./artifacts_optimization_comparison/bls12_381_p--mul--pressure-minimized--seed4604/fiat/fiat_bls12_381_p_mul/seed0000000000004604.dat`).
 
-Note that by default, this will take a long time (easily multiple wall-clock
-hours). You can speed up this process by (1) increasing the parallel batch
-size, (2) reducing the number of evaluations, or (3) disabling CryptOpt's
-verified correctness checking by passing `--no-proof`. The command above
-reflects the configuration used to achieve the results in the paper.
-
-## AUCurves Case Study (§6)
-
-As a final practical demonstration of the proposed scheduling mechanism, we
-integrate the assembly yielded from our ordering process into
-[AUCurves](https://github.com/mit-plv/AUCurves). This project builds upon [Fiat
-Cryptography](https://github.com/mit-plv/fiat-crypto) and provides verified
-high level cryptographic constructions, including scalar multiplication and
-pairing operations (used, e.g., in identity-based encryption).
-
-As AUCurves already integrates with Fiat (resp. CryptOpt), most of the
-benchmarking infrastructure provided here concerns itself with automation, as
-to to make reproducibility easier. Assuming that you have executed the previous
-two stages (i.e., have the `./artifacts_start_states` and
-`./artifacts_optimization_comparison` artifacts), you can execute:
-
-```bash
-python3 ./bench_aucurves.py --cpu 0 \
-    ./artifacts_start_states \
-    ./artifacts_optimization_comparison
-```
-
-This benchmarks a full BLS12-381 pairing, as provided by the
-`bls12-381-safe-rust` crate. The pairing code is held fixed; what varies is the
-field multiplication and squaring leaves underneath it, which are swapped for
-each of the following backends:
-
-1. `rust`: The crate's own Rust field arithmetic, with no assembly linked.
-1. `ref`: Pre-optimized (10k mutations) CryptOpt assembly that AUCurves vendors
-   itself, taken from `AUCurves/src/Implementations/C/cryptopt`.
-1. `defnoopt` and `pmnoopt`: An unoptimized CryptOpt assembly variant (produced
-   as part of `./artifacts_start_states`) under each of the two scheduling
-   strategies.
-1. `defopt` and `pmopt`: An optimized CryptOpt assembly variant (produced as
-   part of `./artifacts_optimization_comparison`) after 100k mutations.
-
-The benchmarking results of all tested configurations are written to a CSV file
-under `./artifacts_aucurves/aucurves_bench.csv`. The benchmarking process takes
-under a minute, most of which is spent rebuilding the crate between backends.
-
-By default each configuration is measured three times and the fastest run is
-kept. Pass `--repeat` to change that, `--cpu N` to pin the benchmark to a
-single core via `taskset`, or `--help` to see the remaining options. The
+Note that optimizing all targets can take a long time (easily multiple
+wall-clock hours). You can speed up this process by (1) increasing the parallel
+batch size, (2) reducing the number of evaluations, or (3) disabling CryptOpt's
+verified correctness checking by passing `--no-proof` to `bench.py`. The
 command above reflects the configuration used to achieve the results in the
 paper.
